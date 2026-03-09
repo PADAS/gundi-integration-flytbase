@@ -1,6 +1,37 @@
 # gundi-integration-action-runner
 Template repo for integration in Gundi v2.
 
+## Integrations
+
+### FlytBase
+This repo includes an integration with [FlytBase](https://flytbase.com/) for collecting drone and dock telemetry data via Socket.IO WebSockets.
+
+**Actions:**
+
+- **`action_auth`** — Authenticates with FlytBase using OAuth2 client credentials. Requires `client_id`, `client_secret`, `org_id`, and `server_region` (US or EU). Tokens are cached in Redis for reuse by the pull action.
+
+- **`action_pull_observations`** — Pulls real-time telemetry from FlytBase drones and docks. Runs every 5 minutes via cron schedule (`*/5 * * * *`). Connects to FlytBase Socket.IO endpoints and subscribes to telemetry channels for a configurable collection window (default 270 seconds).
+
+  **Drone telemetry** (per drone via `{drone_id}/global_position`):
+  - GPS position (latitude, longitude)
+  - Elevation, height, speed (horizontal, vertical, converted to km/h)
+  - GPS satellite count, home distance, RTK quality/satellites/fix state
+
+  **Dock telemetry** (per dock, optional):
+  - **Dock state** (`{dock_id}/dock_state`): enclosure state, charging rod/drone charging state, power state, emergency stop, occupancy, operation mode, connection status, flight operations count
+  - **Dock weather** (`{dock_id}/weather`): temperature, humidity, rainfall, wind speed and direction
+  - **Dock position** (`{dock_id}/global_position`): GPS coordinates used to geotag dock state and weather observations
+
+**Configuration options for `action_pull_observations`:**
+  - `drone_ids` — list of FlytBase drone device IDs (required)
+  - `dock_ids` — optional list of dock device IDs
+  - `window_duration_seconds` — telemetry collection window (30–480s, default 270s)
+  - `subject_type` / `dock_subject_type` — Gundi subject types (default: "drone" / "dock")
+  - `drone_name_map` / `dock_name_map` — optional ID-to-name mappings
+  - `collect_dock_state` / `collect_dock_weather` — toggles for dock data streams (default: true)
+
+Observations are sent to Gundi in batches of 200. See [`docs/`](docs/) for FlytBase API reference documentation.
+
 ## Usage
 - Fork this repo
 - Implement your own actions in `actions/handlers.py`
