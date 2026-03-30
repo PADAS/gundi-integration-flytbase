@@ -69,7 +69,6 @@ class FlytBasePullObservationsConfig(PullActionConfiguration):
             "FlytBase drone device IDs to subscribe to (MongoDB ObjectId format). "
             "Find these in the FlytBase dashboard under your drone devices."
         ),
-        ui_options=UIOptions(widget="text"),
     )
     window_duration_seconds: int = FieldWithUIOptions(
         270,
@@ -106,7 +105,6 @@ class FlytBasePullObservationsConfig(PullActionConfiguration):
             "Find these in the FlytBase dashboard under your docking station devices. "
             "If omitted, no dock telemetry is collected."
         ),
-        ui_options=UIOptions(widget="text"),
     )
     dock_name_map: Optional[Dict[str, str]] = FieldWithUIOptions(
         None,
