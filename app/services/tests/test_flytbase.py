@@ -253,6 +253,14 @@ async def test_collect_connects_with_correct_auth(mocker):
             await registered_events["connect"]()
 
     mock_sio.connect = connect_and_fire
+
+    original_disconnect = mock_sio.disconnect
+    async def disconnect_and_fire():
+        await original_disconnect()
+        if "disconnect" in registered_events:
+            await registered_events["disconnect"]()
+    mock_sio.disconnect = disconnect_and_fire
+
     mocker.patch("asyncio.sleep", new_callable=AsyncMock)
 
     await flytbase.collect_drone_positions(
@@ -302,6 +310,14 @@ async def test_collect_registers_handler_per_drone(mocker):
             await registered_events["connect"]()
 
     mock_sio.connect = connect_and_fire
+
+    original_disconnect = mock_sio.disconnect
+    async def disconnect_and_fire():
+        await original_disconnect()
+        if "disconnect" in registered_events:
+            await registered_events["disconnect"]()
+    mock_sio.disconnect = disconnect_and_fire
+
     mocker.patch("asyncio.sleep", new_callable=AsyncMock)
 
     drone_ids = ["drone-001", "drone-002", "drone-003"]
@@ -343,6 +359,14 @@ async def test_collect_returns_empty_when_no_messages(mocker):
             await registered_events["connect"]()
 
     mock_sio.connect = connect_and_fire
+
+    original_disconnect = mock_sio.disconnect
+    async def disconnect_and_fire():
+        await original_disconnect()
+        if "disconnect" in registered_events:
+            await registered_events["disconnect"]()
+    mock_sio.disconnect = disconnect_and_fire
+
     mocker.patch("asyncio.sleep", new_callable=AsyncMock)
 
     result = await flytbase.collect_drone_positions(
@@ -432,6 +456,14 @@ def _make_dock_sio_mock(mocker, registered_events, registered_channels):
             await registered_events["connect"]()
 
     mock_sio.connect = connect_and_fire
+
+    original_disconnect = mock_sio.disconnect
+    async def disconnect_and_fire():
+        await original_disconnect()
+        if "disconnect" in registered_events:
+            await registered_events["disconnect"]()
+    mock_sio.disconnect = disconnect_and_fire
+
     return mock_sio, original_connect
 
 
@@ -516,6 +548,14 @@ async def test_collect_dock_telemetry_captures_dock_location(mocker, sample_dock
             await registered_channels_map[pos_channel](sample_dock_global_position)
 
     mock_sio.connect = connect_and_fire
+
+    original_disconnect = mock_sio.disconnect
+    async def disconnect_and_fire():
+        await original_disconnect()
+        if "disconnect" in registered_events:
+            await registered_events["disconnect"]()
+    mock_sio.disconnect = disconnect_and_fire
+
     mocker.patch("asyncio.sleep", new_callable=AsyncMock)
 
     result = await flytbase.collect_dock_telemetry(

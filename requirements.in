@@ -1,1 +1,4 @@
 # Add your integration-specific dependencies here
+marshmallow<4.0.0
+httpx<0.28  # starlette 0.27 TestClient incompatible with httpx 0.28+
+python-socketio[asyncio_client]
