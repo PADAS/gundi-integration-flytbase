@@ -35,12 +35,7 @@ async def action_auth(integration, action_config: FlytBaseAuthConfig):
     await state_manager.set_state(
         integration_id=integration_id,
         action_id="auth",
-        state={
-            "access_token": token_response["access"]["token"],
-            "access_token_expiry": token_response["access"].get("expiry"),
-            "refresh_token": token_response["refresh"]["token"],
-            "refresh_token_expiry": token_response["refresh"].get("expiry"),
-        },
+        state=_token_state_from_response(token_response),
     )
 
     logger.info(f"FlytBase tokens stored for integration {integration_id}")
@@ -171,14 +166,31 @@ async def action_pull_observations(integration, action_config: FlytBasePullObser
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
+def _token_state_from_response(token_response: dict) -> dict:
+    """
+    Builds the Redis state dict from a FlytBase token response, computing absolute
+    expiry timestamps. FlytBase returns `expires_in` (seconds), not an absolute
+    time, so expiry is derived via flytbase.get_token_expiry.
+    """
+    access = token_response["access"]
+    refresh = token_response.get("refresh") or {}
+    return {
+        "access_token": access["token"],
+        "access_token_expiry": flytbase.get_token_expiry(access),
+        "refresh_token": refresh.get("token"),
+        "refresh_token_expiry": flytbase.get_token_expiry(refresh),
+    }
+
+
 async def _get_valid_access_token(integration) -> str:
     """
-    Returns a valid FlytBase access token, refreshing or re-authenticating as needed.
+    Returns a valid FlytBase access token, re-authenticating if the cached token
+    is missing or expired.
 
-    Decision tree:
-      - Cached access token valid → return it
-      - Cached refresh token valid → refresh → store → return new access token
-      - Both expired/missing → full re-auth using auth config credentials → store → return
+    FlytBase exposes only the client-credentials token endpoint (GET /oauth/token),
+    which returns a fresh access token on each call. There is no usable refresh
+    grant (POST to the token endpoint returns 404), so "refresh" is simply a
+    re-authentication using the stored client credentials.
     """
     integration_id = str(integration.id)
     token_state = await state_manager.get_state(
@@ -188,36 +200,23 @@ async def _get_valid_access_token(integration) -> str:
 
     access_token = token_state.get("access_token")
     access_expiry = token_state.get("access_token_expiry")
-    refresh_token = token_state.get("refresh_token")
-    refresh_expiry = token_state.get("refresh_token_expiry")
 
     if access_token and not flytbase.is_token_expired(access_expiry):
         return access_token
 
-    if refresh_token and not flytbase.is_token_expired(refresh_expiry, buffer_seconds=0):
-        logger.info("Access token expiring; refreshing using refresh token.")
-        token_response = await flytbase.refresh_flytbase_token(refresh_token)
-    else:
-        logger.warning(
-            "Both access and refresh tokens missing or expired. Re-authenticating."
+    logger.info("FlytBase access token missing or expired; re-authenticating.")
+    auth_data = _get_auth_config_data(integration)
+    if not auth_data:
+        raise ValueError(
+            "Cannot re-authenticate: auth action configuration missing. "
+            "Please configure and run the 'auth' action manually."
         )
-        auth_data = _get_auth_config_data(integration)
-        if not auth_data:
-            raise ValueError(
-                "Cannot re-authenticate: auth action configuration missing. "
-                "Please configure and run the 'auth' action manually."
-            )
-        token_response = await flytbase.get_flytbase_token(
-            client_id=auth_data["client_id"],
-            client_secret=auth_data["client_secret"],
-        )
+    token_response = await flytbase.get_flytbase_token(
+        client_id=auth_data["client_id"],
+        client_secret=auth_data["client_secret"],
+    )
 
-    new_state = {
-        "access_token": token_response["access"]["token"],
-        "access_token_expiry": token_response["access"].get("expiry"),
-        "refresh_token": token_response["refresh"]["token"],
-        "refresh_token_expiry": token_response["refresh"].get("expiry"),
-    }
+    new_state = _token_state_from_response(token_response)
     await state_manager.set_state(
         integration_id=integration_id,
         action_id="auth",

@@ -1,10 +1,19 @@
 import asyncio
+import base64
+import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from app.services import flytbase
+
+
+def _make_jwt(exp: int) -> str:
+    """Builds an unsigned JWT carrying a given exp claim (for expiry-parsing tests)."""
+    def seg(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+    return f"{seg({'alg': 'none'})}.{seg({'exp': exp})}.sig"
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -76,7 +85,7 @@ async def test_get_flytbase_token_success(mocker, mock_token_response):
     mock_response.raise_for_status = MagicMock()
 
     mock_client = AsyncMock()
-    mock_client.__aenter__.return_value.post = AsyncMock(return_value=mock_response)
+    mock_client.__aenter__.return_value.get = AsyncMock(return_value=mock_response)
     mocker.patch("app.services.flytbase.httpx.AsyncClient", return_value=mock_client)
 
     result = await flytbase.get_flytbase_token("my-client-id", "my-secret")
@@ -87,7 +96,7 @@ async def test_get_flytbase_token_success(mocker, mock_token_response):
     # Verify Basic auth header was constructed correctly
     import base64
     expected_b64 = base64.b64encode(b"my-client-id:my-secret").decode()
-    call_kwargs = mock_client.__aenter__.return_value.post.call_args
+    call_kwargs = mock_client.__aenter__.return_value.get.call_args
     assert f"Basic {expected_b64}" in str(call_kwargs)
 
 
@@ -103,7 +112,7 @@ async def test_get_flytbase_token_raises_on_http_error(mocker):
     )
 
     mock_client = AsyncMock()
-    mock_client.__aenter__.return_value.post = AsyncMock(return_value=mock_response)
+    mock_client.__aenter__.return_value.get = AsyncMock(return_value=mock_response)
     mocker.patch("app.services.flytbase.httpx.AsyncClient", return_value=mock_client)
 
     with pytest.raises(httpx.HTTPStatusError):
@@ -141,6 +150,30 @@ def test_is_token_expired_custom_buffer():
     # 30 seconds from now, buffer=0 → not expired
     soon = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
     assert flytbase.is_token_expired(soon, buffer_seconds=0) is False
+
+
+# ── Token expiry derivation (get_token_expiry) ────────────────────────────────
+
+def test_get_token_expiry_from_expires_in():
+    """FlytBase returns expires_in (seconds); expiry should be now + expires_in."""
+    iso = flytbase.get_token_expiry({"token": "x", "expires_in": 900})
+    assert iso is not None
+    delta = (datetime.fromisoformat(iso) - datetime.now(timezone.utc)).total_seconds()
+    assert 880 < delta <= 900
+
+
+def test_get_token_expiry_falls_back_to_jwt_exp():
+    """With no expires_in, expiry comes from the JWT exp claim."""
+    exp = int((datetime.now(timezone.utc) + timedelta(minutes=15)).timestamp())
+    iso = flytbase.get_token_expiry({"token": _make_jwt(exp)})
+    assert iso is not None
+    assert datetime.fromisoformat(iso) == datetime.fromtimestamp(exp, timezone.utc)
+
+
+def test_get_token_expiry_none_when_no_info():
+    assert flytbase.get_token_expiry({"token": "not-a-jwt"}) is None
+    assert flytbase.get_token_expiry({}) is None
+    assert flytbase.get_token_expiry({"token": None}) is None
 
 
 # ── Observation transformation ────────────────────────────────────────────────
@@ -266,7 +299,7 @@ async def test_collect_connects_with_correct_auth(mocker):
     original_connect.assert_called_once()
     call_kwargs = original_connect.call_args.kwargs
     assert call_kwargs["auth"]["authorization"] == "Bearer test-token"
-    assert call_kwargs["auth"]["orgId"] == "test-org-id"
+    assert call_kwargs["auth"]["org-id"] == "test-org-id"
     assert call_kwargs["transports"] == ["websocket"]
     assert "api.flytbase.com" in original_connect.call_args.args[0]
 
@@ -455,7 +488,7 @@ async def test_collect_dock_telemetry_connects_with_correct_auth(mocker):
     original_connect.assert_called_once()
     call_kwargs = original_connect.call_args.kwargs
     assert call_kwargs["auth"]["authorization"] == "Bearer dock-token"
-    assert call_kwargs["auth"]["orgId"] == "org-123"
+    assert call_kwargs["auth"]["org-id"] == "org-123"
     assert call_kwargs["transports"] == ["websocket"]
     assert "api.flytbase.com" in original_connect.call_args.args[0]
 

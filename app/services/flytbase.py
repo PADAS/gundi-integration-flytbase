@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -30,7 +31,7 @@ async def get_flytbase_token(client_id: str, client_secret: str) -> dict:
     """
     credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     async with httpx.AsyncClient() as client:
-        response = await client.post(
+        response = await client.get(
             FLYTBASE_TOKEN_URL,
             headers={"Authorization": f"Basic {credentials}"},
             timeout=15.0,
@@ -39,23 +40,45 @@ async def get_flytbase_token(client_id: str, client_secret: str) -> dict:
         return response.json()
 
 
-async def refresh_flytbase_token(refresh_token: str) -> dict:
+def _decode_jwt_exp(token: Optional[str]) -> Optional[int]:
     """
-    Uses a refresh token to obtain a new access token.
-
-    NOTE: The exact FlytBase refresh grant type is assumed to be standard OAuth2
-    (grant_type=refresh_token). Verify against FlytBase docs if this fails.
-
-    Returns the same dict shape as get_flytbase_token.
+    Returns the `exp` (unix timestamp) claim from a JWT WITHOUT verifying the
+    signature, or None if it cannot be read. Used only to derive token expiry.
     """
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            FLYTBASE_TOKEN_URL,
-            data={"grant_type": "refresh_token", "refresh_token": refresh_token},
-            timeout=15.0,
-        )
-        response.raise_for_status()
-        return response.json()
+    if not token:
+        return None
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)  # restore base64 padding
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        exp = claims.get("exp")
+        return int(exp) if exp is not None else None
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+def get_token_expiry(token_data: dict) -> Optional[str]:
+    """
+    Returns a token's absolute expiry as an ISO 8601 UTC string.
+
+    FlytBase returns the lifetime as `expires_in` (seconds) on each token object;
+    the absolute expiry is also encoded in the JWT `exp` claim. Prefer `expires_in`
+    and fall back to decoding the JWT. Returns None if neither is available.
+
+    NOTE: FlytBase does NOT return an `expiry` field — the original code read
+    `.get("expiry")`, which was always None and made every token look expired.
+    """
+    if not token_data:
+        return None
+    expires_in = token_data.get("expires_in")
+    if isinstance(expires_in, (int, float)):
+        return (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
+    exp = _decode_jwt_exp(token_data.get("token"))
+    if exp is not None:
+        return datetime.fromtimestamp(exp, timezone.utc).isoformat()
+    return None
 
 
 def is_token_expired(expiry_iso: Optional[str], buffer_seconds: int = 120) -> bool:
@@ -140,7 +163,10 @@ async def collect_drone_positions(
             transports=["websocket"],
             auth={
                 "authorization": f"Bearer {access_token}",
-                "orgId": org_id,
+                # Field is "org-id" per the AsyncAPI handshakeAuth spec. The docs
+                # quick-start example shows "orgId", but the live server rejects
+                # that with "organization undefined" (AUTH_FAILED).
+                "org-id": org_id,
             },
             wait_timeout=10,
         )
@@ -261,7 +287,10 @@ async def collect_dock_telemetry(
             transports=["websocket"],
             auth={
                 "authorization": f"Bearer {access_token}",
-                "orgId": org_id,
+                # Field is "org-id" per the AsyncAPI handshakeAuth spec. The docs
+                # quick-start example shows "orgId", but the live server rejects
+                # that with "organization undefined" (AUTH_FAILED).
+                "org-id": org_id,
             },
             wait_timeout=10,
         )

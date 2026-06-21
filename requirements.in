@@ -1,1 +1,6 @@
 # Add your integration-specific dependencies here
+
+# FlytBase telemetry is collected over Socket.IO (app/services/flytbase.py).
+# The [asyncio_client] extra provides the async websocket transport (aiohttp,
+# already pulled transitively by gcloud-aio-pubsub, so no new conflict).
+python-socketio[asyncio_client]~=5.11
