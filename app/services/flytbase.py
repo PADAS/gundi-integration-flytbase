@@ -133,7 +133,10 @@ def _unwrap(data):
     """
     Returns the telemetry payload, unwrapping the single-element array that some
     FlytBase topics wrap their payload in (`[ {...} ]` instead of `{...}`).
-    See docs/example-telemetry.js: `if (Array.isArray(d)) d = d[0]`.
+
+    Derived from FlytBase's reference telemetry example (`if (Array.isArray(d))
+    d = d[0]`). That example is not committed to this repo — it is FlytBase's
+    own integration sample; capture a copy under docs/ if one is needed.
     """
     if isinstance(data, list):
         return data[0] if data else {}
@@ -281,6 +284,14 @@ async def collect_drone_telemetry(
 
     Raises on connection timeout. On connect_error the function returns empty
     per-drone buckets rather than raising (mirrors collect_dock_telemetry).
+
+    NOTE: the Socket.IO lifecycle below — connect/connect_error/disconnect
+    handlers, the per-topic "Subscribe" emit loop, and the connect → sleep →
+    finally-disconnect block — is duplicated almost verbatim in
+    collect_dock_telemetry. The two differ only in which channels/handlers they
+    register. If this is touched again, consider extracting a shared
+    _collect_over_socketio(topics, handler_registrar, ...) helper so the protocol
+    lives in one place; kept separate for now to keep the change reviewable.
     """
     base_url = FLYTBASE_SOCKET_URLS[server_region.upper()]
     collected: Dict[str, dict] = {
@@ -309,7 +320,8 @@ async def collect_drone_telemetry(
     async def connect():
         # FlytBase telemetry channels do NOT auto-push: after connecting we must
         # emit a per-topic "Subscribe" (capital S) with payload
-        # {"topic": "<id>/<channel>"}, one emit per topic. See docs/example-telemetry.js.
+        # {"topic": "<id>/<channel>"}, one emit per topic. Per FlytBase's reference
+        # telemetry example (their own sample, not committed to this repo).
         logger.info(f"FlytBase Socket.IO connected; subscribing to {len(topics)} topic(s).")
         for topic in topics:
             await sio.emit("Subscribe", {"topic": topic})
@@ -434,7 +446,8 @@ async def collect_dock_telemetry(
     async def connect():
         # FlytBase telemetry requires an explicit per-topic "Subscribe" emit after
         # connecting (capital S, payload {"topic": "<id>/<channel>"}, one per topic).
-        # See docs/example-telemetry.js and collect_drone_telemetry.
+        # See collect_drone_telemetry; rationale per FlytBase's reference telemetry
+        # example (their own sample, not committed to this repo).
         logger.info(f"FlytBase Socket.IO (dock) connected; subscribing to {len(topics)} topic(s).")
         for topic in topics:
             await sio.emit("Subscribe", {"topic": topic})

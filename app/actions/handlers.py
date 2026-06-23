@@ -111,6 +111,14 @@ async def action_pull_observations(integration, action_config: FlytBasePullObser
 
         # Window-average location for this drone's non-positional telemetry, with a
         # dock-location fallback when the drone reported no GPS during the window.
+        #
+        # CAVEAT: battery/state/notification observations require a location (their
+        # transforms return None without one). If a drone reports no GPS — the exact
+        # case for a drone parked in its dock — AND no dock resolves, every such
+        # observation is silently dropped. resolve_dock_for_drone only resolves a
+        # dock for a single-dock deployment or an explicit drone_dock_map entry, so
+        # a multi-dock deployment that omits drone_dock_map loses all idle-drone
+        # battery/state/notification telemetry. See the drone_dock_map config field.
         loc = flytbase.average_location(drone_data["positions"])
         if loc is None:
             dock_id = flytbase.resolve_dock_for_drone(
