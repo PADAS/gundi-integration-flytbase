@@ -57,6 +57,7 @@ async def action_auth(integration, action_config: FlytBaseAuthConfig):
     logger.info(f"FlytBase tokens stored for integration {integration_id}")
     return {"valid_credentials": True}
 
+
 @activity_logger()
 @crontab_schedule("*/5 * * * *")  # Every 5 minutes
 async def action_pull_observations(integration, action_config: FlytBasePullObservationsConfig):
