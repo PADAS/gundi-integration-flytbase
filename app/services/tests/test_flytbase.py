@@ -170,10 +170,28 @@ def test_get_token_expiry_falls_back_to_jwt_exp():
     assert datetime.fromisoformat(iso) == datetime.fromtimestamp(exp, timezone.utc)
 
 
+def test_get_token_expiry_falls_back_to_absolute_expiry_field():
+    """If the API instead returns an absolute `expiry` (ISO string or unix ts),
+    that is used when neither expires_in nor a JWT exp is available."""
+    future = datetime.now(timezone.utc) + timedelta(minutes=15)
+    iso = flytbase.get_token_expiry({"token": "not-a-jwt", "expiry": future.isoformat()})
+    assert datetime.fromisoformat(iso) == future
+    ts = int(future.timestamp())
+    iso_from_ts = flytbase.get_token_expiry({"token": "not-a-jwt", "expiry": ts})
+    assert datetime.fromisoformat(iso_from_ts) == datetime.fromtimestamp(ts, timezone.utc)
+
+
+def test_get_token_expiry_naive_expiry_string_treated_as_utc():
+    """A naive ISO `expiry` (no tzinfo) is interpreted as UTC, not local time."""
+    iso = flytbase.get_token_expiry({"token": "x", "expiry": "2099-01-01T00:00:00"})
+    assert iso == "2099-01-01T00:00:00+00:00"
+
+
 def test_get_token_expiry_none_when_no_info():
     assert flytbase.get_token_expiry({"token": "not-a-jwt"}) is None
     assert flytbase.get_token_expiry({}) is None
     assert flytbase.get_token_expiry({"token": None}) is None
+    assert flytbase.get_token_expiry({"token": "x", "expiry": "garbage"}) is None
 
 
 # ── Observation transformation ────────────────────────────────────────────────

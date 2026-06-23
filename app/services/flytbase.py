@@ -24,8 +24,12 @@ async def get_flytbase_token(client_id: str, client_secret: str) -> dict:
     """
     Performs OAuth2 Client Credentials flow against the FlytBase token endpoint.
 
-    Returns the full token response dict:
-      {"access": {"token": str, "expiry": str}, "refresh": {"token": str, "expiry": str}}
+    Returns the full token response dict, shaped roughly as:
+      {"access": {"token": str, ...}, "refresh": {"token": str, ...}}
+
+    Each token object carries its own lifetime, but the exact field is not a
+    documented contract — get_token_expiry derives the absolute expiry from
+    whichever of `expires_in`, the JWT `exp` claim, or `expiry` is present.
 
     Raises httpx.HTTPStatusError on 401/403.
     """
@@ -61,14 +65,20 @@ def _decode_jwt_exp(token: Optional[str]) -> Optional[int]:
 
 def get_token_expiry(token_data: dict) -> Optional[str]:
     """
-    Returns a token's absolute expiry as an ISO 8601 UTC string.
+    Returns a token's absolute expiry as an ISO 8601 UTC string, or None if it
+    cannot be determined.
 
-    FlytBase returns the lifetime as `expires_in` (seconds) on each token object;
-    the absolute expiry is also encoded in the JWT `exp` claim. Prefer `expires_in`
-    and fall back to decoding the JWT. Returns None if neither is available.
+    The exact shape of the FlytBase token response is not contractually
+    documented, so this tries every plausible source in turn and is correct
+    regardless of which one the live API actually provides:
+      1. `expires_in` (relative lifetime in seconds) -> now + expires_in.
+      2. The JWT `exp` claim decoded from the token itself (access tokens are
+         JWTs), which needs no separate expiry field at all.
+      3. An absolute `expiry` field (ISO 8601 string or unix timestamp), the
+         shape the original code assumed.
 
-    NOTE: FlytBase does NOT return an `expiry` field — the original code read
-    `.get("expiry")`, which was always None and made every token look expired.
+    The 5-min pull cadence plus the 2-min is_token_expired buffer means a wrong
+    guess only costs an extra re-auth, never a failed pull.
     """
     if not token_data:
         return None
@@ -78,7 +88,25 @@ def get_token_expiry(token_data: dict) -> Optional[str]:
     exp = _decode_jwt_exp(token_data.get("token"))
     if exp is not None:
         return datetime.fromtimestamp(exp, timezone.utc).isoformat()
-    return None
+    return _normalize_expiry(token_data.get("expiry"))
+
+
+def _normalize_expiry(expiry) -> Optional[str]:
+    """
+    Coerces an absolute `expiry` value (ISO 8601 string or unix timestamp) into an
+    ISO 8601 UTC string, or None if it is absent/unparseable.
+    """
+    if expiry is None:
+        return None
+    if isinstance(expiry, (int, float)):
+        return datetime.fromtimestamp(expiry, timezone.utc).isoformat()
+    try:
+        parsed = datetime.fromisoformat(expiry)
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.isoformat()
 
 
 def is_token_expired(expiry_iso: Optional[str], buffer_seconds: int = 120) -> bool:
