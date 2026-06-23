@@ -30,6 +30,7 @@ async def action_auth(integration, action_config: FlytBaseAuthConfig):
     token_response = await flytbase.get_flytbase_token(
         client_id=action_config.client_id,
         client_secret=action_config.client_secret.get_secret_value(),
+        base_url=action_config.base_url,
     )
 
     await state_manager.set_state(
@@ -74,14 +75,14 @@ async def action_pull_observations(integration, action_config: FlytBasePullObser
             "Please configure and run the 'auth' action first."
         )
     org_id = auth_data["org_id"]
-    server_region = auth_data.get("server_region", "US")
+    base_url = auth_data.get("base_url") or flytbase.FLYTBASE_DEFAULT_BASE_URL
 
     # ── Step 3: Collect positions via Socket.IO (drone + dock in parallel) ──────
     drone_task = flytbase.collect_drone_telemetry(
         access_token=access_token,
         org_id=org_id,
         drone_ids=action_config.drone_ids,
-        server_region=server_region,
+        base_url=base_url,
         window_seconds=action_config.window_duration_seconds,
         collect_battery=action_config.collect_drone_battery,
         collect_drone_state=action_config.collect_drone_state,
@@ -92,7 +93,7 @@ async def action_pull_observations(integration, action_config: FlytBasePullObser
             access_token=access_token,
             org_id=org_id,
             dock_ids=action_config.dock_ids,
-            server_region=server_region,
+            base_url=base_url,
             window_seconds=action_config.window_duration_seconds,
             collect_dock_state=action_config.collect_dock_state,
             collect_dock_weather=action_config.collect_dock_weather,
@@ -285,6 +286,7 @@ async def _get_valid_access_token(integration) -> str:
     token_response = await flytbase.get_flytbase_token(
         client_id=auth_data["client_id"],
         client_secret=auth_data["client_secret"],
+        base_url=auth_data.get("base_url") or flytbase.FLYTBASE_DEFAULT_BASE_URL,
     )
 
     new_state = _token_state_from_response(token_response)

@@ -4,23 +4,41 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import httpx
 import socketio
 
 logger = logging.getLogger(__name__)
 
-FLYTBASE_TOKEN_URL = "https://api.flytbase.com/oauth/token"
-FLYTBASE_SOCKET_URLS = {
-    "US": "wss://api.flytbase.com",
-    "EU": "wss://api-eu.flytbase.com",
-}
+# Base URL of the FlytBase API. The server region is no longer a fixed enum;
+# operators supply the full base URL for their region (validated in the auth
+# config), and the token + Socket.IO endpoints are derived from it.
+FLYTBASE_DEFAULT_BASE_URL = "https://api.flytbase.com"
+FLYTBASE_TOKEN_PATH = "/oauth/token"
 FLYTBASE_SOCKET_PATH = "/socket/socket.io"
+
+
+def token_url_for(base_url: str) -> str:
+    """Token endpoint for a base URL, e.g. https://api.flytbase.com/oauth/token."""
+    return base_url.rstrip("/") + FLYTBASE_TOKEN_PATH
+
+
+def socket_url_for(base_url: str) -> str:
+    """
+    Socket.IO endpoint for a base URL: the same host with the scheme swapped to
+    ws/wss (https -> wss, http -> ws). Socket.IO connects over WebSocket.
+    """
+    parsed = urlparse(base_url)
+    scheme = "ws" if parsed.scheme in ("http", "ws") else "wss"
+    return f"{scheme}://{parsed.netloc}"
 
 
 # ── OAuth ────────────────────────────────────────────────────────────────────
 
-async def get_flytbase_token(client_id: str, client_secret: str) -> dict:
+async def get_flytbase_token(
+    client_id: str, client_secret: str, base_url: str = FLYTBASE_DEFAULT_BASE_URL
+) -> dict:
     """
     Performs OAuth2 Client Credentials flow against the FlytBase token endpoint.
 
@@ -36,7 +54,7 @@ async def get_flytbase_token(client_id: str, client_secret: str) -> dict:
     credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            FLYTBASE_TOKEN_URL,
+            token_url_for(base_url),
             headers={"Authorization": f"Basic {credentials}"},
             timeout=15.0,
         )
@@ -258,7 +276,7 @@ async def collect_drone_telemetry(
     access_token: str,
     org_id: str,
     drone_ids: List[str],
-    server_region: str,
+    base_url: str,
     window_seconds: int,
     collect_battery: bool = True,
     collect_drone_state: bool = True,
@@ -293,7 +311,7 @@ async def collect_drone_telemetry(
     _collect_over_socketio(topics, handler_registrar, ...) helper so the protocol
     lives in one place; kept separate for now to keep the change reviewable.
     """
-    base_url = FLYTBASE_SOCKET_URLS[server_region.upper()]
+    socket_url = socket_url_for(base_url)
     collected: Dict[str, dict] = {
         did: {"positions": [], "battery": [], "drone_state": [], "notification": []}
         for did in drone_ids
@@ -355,7 +373,7 @@ async def collect_drone_telemetry(
 
     try:
         await sio.connect(
-            base_url,
+            socket_url,
             socketio_path=FLYTBASE_SOCKET_PATH,
             transports=["websocket"],
             auth={
@@ -393,7 +411,7 @@ async def collect_dock_telemetry(
     access_token: str,
     org_id: str,
     dock_ids: List[str],
-    server_region: str,
+    base_url: str,
     window_seconds: int,
     collect_dock_state: bool = True,
     collect_dock_weather: bool = True,
@@ -420,7 +438,7 @@ async def collect_dock_telemetry(
     collect_dock_state and collect_dock_weather control whether those channels
     are subscribed; global_position is always subscribed regardless.
     """
-    base_url = FLYTBASE_SOCKET_URLS[server_region.upper()]
+    socket_url = socket_url_for(base_url)
     collected: Dict[str, dict] = {
         did: {"dock_state": [], "weather": [], "dock_location": None}
         for did in dock_ids
@@ -498,7 +516,7 @@ async def collect_dock_telemetry(
 
     try:
         await sio.connect(
-            base_url,
+            socket_url,
             socketio_path=FLYTBASE_SOCKET_PATH,
             transports=["websocket"],
             auth={

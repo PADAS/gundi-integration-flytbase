@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import ValidationError
 from gundi_core.schemas.v2 import Integration
 
 from app.actions.configurations import FlytBaseAuthConfig, FlytBasePullObservationsConfig
@@ -86,7 +87,7 @@ def flytbase_integration(integration_v2_as_dict):
                 "client_id": "test-client-id",
                 "client_secret": "test-client-secret",
                 "org_id": "test-org-id",
-                "server_region": "US",
+                "base_url": "https://api.flytbase.com",
             }
     return Integration.parse_obj(data)
 
@@ -97,8 +98,35 @@ def auth_config():
         client_id="test-client-id",
         client_secret="test-client-secret",
         org_id="test-org-id",
-        server_region="US",
+        base_url="https://api.flytbase.com",
     )
+
+
+# ── FlytBaseAuthConfig.base_url validation ────────────────────────────────────
+
+def _auth_config(base_url):
+    return FlytBaseAuthConfig(
+        client_id="id", client_secret="secret", org_id="org", base_url=base_url
+    )
+
+
+def test_base_url_defaults_to_us_host():
+    config = FlytBaseAuthConfig(client_id="id", client_secret="secret", org_id="org")
+    assert config.base_url == "https://api.flytbase.com"
+
+
+def test_base_url_strips_trailing_slash():
+    assert _auth_config("https://api.flytbase.com/").base_url == "https://api.flytbase.com"
+
+
+def test_base_url_accepts_alternate_region_host():
+    assert _auth_config("https://api-eu.flytbase.com").base_url == "https://api-eu.flytbase.com"
+
+
+@pytest.mark.parametrize("bad_url", ["not-a-url", "ftp://api.flytbase.com", "api.flytbase.com", ""])
+def test_base_url_rejects_invalid_urls(bad_url):
+    with pytest.raises(ValidationError):
+        _auth_config(bad_url)
 
 
 @pytest.fixture
@@ -163,6 +191,7 @@ async def test_action_auth_stores_tokens(
     mock_get_token.assert_called_once_with(
         client_id="test-client-id",
         client_secret="test-client-secret",
+        base_url="https://api.flytbase.com",
     )
     mock_sm.set_state.assert_called_once()
     call_kwargs = mock_sm.set_state.call_args.kwargs
@@ -252,6 +281,7 @@ async def test_pull_reauths_when_access_token_expired(
     mock_get_token.assert_called_once_with(
         client_id="test-client-id",
         client_secret="test-client-secret",
+        base_url="https://api.flytbase.com",
     )
     # New token stored
     mock_sm.set_state.assert_called()
@@ -284,6 +314,7 @@ async def test_pull_full_reauth_when_both_tokens_expired(
     mock_get_token.assert_called_once_with(
         client_id="test-client-id",
         client_secret="test-client-secret",
+        base_url="https://api.flytbase.com",
     )
 
 

@@ -119,6 +119,43 @@ async def test_get_flytbase_token_raises_on_http_error(mocker):
         await flytbase.get_flytbase_token("bad-id", "bad-secret")
 
 
+@pytest.mark.asyncio
+async def test_get_flytbase_token_uses_base_url(mocker, mock_token_response):
+    """The token request hits <base_url>/oauth/token, not a hardcoded host."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = mock_token_response
+    mock_response.raise_for_status = MagicMock()
+
+    mock_get = AsyncMock(return_value=mock_response)
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value.get = mock_get
+    mocker.patch("app.services.flytbase.httpx.AsyncClient", return_value=mock_client)
+
+    await flytbase.get_flytbase_token("id", "secret", base_url="https://api-eu.flytbase.com")
+
+    requested_url = mock_get.call_args.args[0]
+    assert requested_url == "https://api-eu.flytbase.com/oauth/token"
+
+
+# ── URL derivation ────────────────────────────────────────────────────────────
+
+def test_token_url_for_appends_oauth_path():
+    assert flytbase.token_url_for("https://api.flytbase.com") == "https://api.flytbase.com/oauth/token"
+
+
+def test_token_url_for_strips_trailing_slash():
+    assert flytbase.token_url_for("https://api.flytbase.com/") == "https://api.flytbase.com/oauth/token"
+
+
+def test_socket_url_for_swaps_https_to_wss():
+    assert flytbase.socket_url_for("https://api.flytbase.com") == "wss://api.flytbase.com"
+    assert flytbase.socket_url_for("https://api-eu.flytbase.com") == "wss://api-eu.flytbase.com"
+
+
+def test_socket_url_for_swaps_http_to_ws():
+    assert flytbase.socket_url_for("http://localhost:8080") == "ws://localhost:8080"
+
+
 # ── Token expiry checks ───────────────────────────────────────────────────────
 
 def test_is_token_expired_fresh_token():
@@ -310,7 +347,7 @@ async def test_collect_connects_with_correct_auth(mocker):
         access_token="test-token",
         org_id="test-org-id",
         drone_ids=[DRONE_ID],
-        server_region="US",
+        base_url="https://api.flytbase.com",
         window_seconds=1,
     )
 
@@ -360,7 +397,7 @@ async def test_collect_registers_handler_per_drone(mocker):
         access_token="tok",
         org_id="org",
         drone_ids=drone_ids,
-        server_region="US",
+        base_url="https://api.flytbase.com",
         window_seconds=1,
     )
 
@@ -403,7 +440,7 @@ async def test_collect_returns_empty_when_no_messages(mocker):
         access_token="tok",
         org_id="org",
         drone_ids=[DRONE_ID],
-        server_region="EU",
+        base_url="https://api-eu.flytbase.com",
         window_seconds=1,
     )
 
@@ -458,7 +495,7 @@ async def test_collect_emits_subscribe_per_drone(mocker):
         access_token="tok",
         org_id="org",
         drone_ids=drone_ids,
-        server_region="US",
+        base_url="https://api.flytbase.com",
         window_seconds=1,
     )
 
@@ -508,7 +545,7 @@ async def test_collect_unwraps_array_wrapped_payload(mocker, sample_position_ful
         access_token="tok",
         org_id="org",
         drone_ids=[DRONE_ID],
-        server_region="US",
+        base_url="https://api.flytbase.com",
         window_seconds=1,
     )
 
@@ -551,7 +588,7 @@ async def test_collect_telemetry_only_subscribes_enabled_channels(mocker):
 
     await flytbase.collect_drone_telemetry(
         access_token="tok", org_id="org", drone_ids=[DRONE_ID],
-        server_region="US", window_seconds=1,
+        base_url="https://api.flytbase.com", window_seconds=1,
         collect_battery=True, collect_drone_state=False, collect_notifications=False,
     )
 
@@ -739,7 +776,7 @@ async def test_collect_dock_telemetry_connects_with_correct_auth(mocker):
         access_token="dock-token",
         org_id="org-123",
         dock_ids=[DOCK_ID],
-        server_region="US",
+        base_url="https://api.flytbase.com",
         window_seconds=1,
     )
 
@@ -763,7 +800,7 @@ async def test_collect_dock_telemetry_registers_channels_per_dock(mocker):
         access_token="tok",
         org_id="org",
         dock_ids=dock_ids,
-        server_region="US",
+        base_url="https://api.flytbase.com",
         window_seconds=1,
     )
 
@@ -813,7 +850,7 @@ async def test_collect_dock_telemetry_captures_dock_location(mocker, sample_dock
         access_token="tok",
         org_id="org",
         dock_ids=[DOCK_ID],
-        server_region="US",
+        base_url="https://api.flytbase.com",
         window_seconds=1,
     )
 
@@ -831,7 +868,7 @@ async def test_collect_dock_telemetry_skips_channels_when_disabled(mocker):
         access_token="tok",
         org_id="org",
         dock_ids=[DOCK_ID],
-        server_region="US",
+        base_url="https://api.flytbase.com",
         window_seconds=1,
         collect_dock_state=False,
         collect_dock_weather=False,
@@ -854,7 +891,7 @@ async def test_collect_dock_emits_subscribe_for_enabled_channels(mocker):
         access_token="tok",
         org_id="org",
         dock_ids=[DOCK_ID],
-        server_region="US",
+        base_url="https://api.flytbase.com",
         window_seconds=1,
         collect_dock_state=True,
         collect_dock_weather=False,
@@ -879,7 +916,7 @@ async def test_collect_dock_telemetry_returns_empty_when_no_messages(mocker):
         access_token="tok",
         org_id="org",
         dock_ids=[DOCK_ID],
-        server_region="EU",
+        base_url="https://api-eu.flytbase.com",
         window_seconds=1,
     )
 

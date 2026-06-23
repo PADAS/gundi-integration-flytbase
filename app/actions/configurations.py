@@ -1,4 +1,5 @@
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
 import pydantic
 from pydantic import validator
@@ -32,24 +33,29 @@ class FlytBaseAuthConfig(AuthActionConfiguration, ExecutableActionMixin):
         description="FlytBase Organization ID (MongoDB ObjectId format).",
         ui_options=UIOptions(widget="text"),
     )
-    server_region: str = FieldWithUIOptions(
-        "US",
-        title="Server Region",
-        description="FlytBase server region. US: api.flytbase.com, EU: api-eu.flytbase.com",
-        ui_options=UIOptions(
-            widget="select",
-            enumNames=["United States", "European Union"],
+    base_url: str = FieldWithUIOptions(
+        "https://api.flytbase.com",
+        title="FlytBase API URL",
+        description=(
+            "Base URL of the FlytBase API for your server region "
+            "(e.g. https://api.flytbase.com). The OAuth token and Socket.IO "
+            "endpoints are derived from this."
         ),
+        ui_options=UIOptions(widget="text"),
     )
 
-    @validator("server_region")
-    def validate_region(cls, v):
-        if v.upper() not in ("US", "EU"):
-            raise ValueError("server_region must be 'US' or 'EU'")
-        return v.upper()
+    @validator("base_url")
+    def validate_base_url(cls, v):
+        v = (v or "").strip().rstrip("/")
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError(
+                "base_url must be a valid http(s) URL, e.g. https://api.flytbase.com"
+            )
+        return v
 
     ui_global_options = GlobalUISchemaOptions(
-        order=["client_id", "client_secret", "org_id", "server_region"],
+        order=["client_id", "client_secret", "org_id", "base_url"],
     )
 
 
@@ -58,7 +64,7 @@ class FlytBasePullObservationsConfig(PullActionConfiguration):
     Configuration for the scheduled pull action that connects to FlytBase Socket.IO,
     collects drone GPS positions for a time window, and sends them to Gundi as Observations.
 
-    Credentials (client_id, client_secret, org_id, server_region) are taken from the
+    Credentials (client_id, client_secret, org_id, base_url) are taken from the
     auth action configuration — run the auth action first to validate credentials.
     """
 
