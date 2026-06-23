@@ -187,7 +187,7 @@ async def test_action_auth_stores_tokens(
 
     result = await action_auth(integration=flytbase_integration, action_config=auth_config)
 
-    assert result == {"status": "authenticated"}
+    assert result == {"valid_credentials": True}
     mock_get_token.assert_called_once_with(
         client_id="test-client-id",
         client_secret="test-client-secret",
@@ -207,15 +207,43 @@ async def test_action_auth_stores_tokens(
 
 
 @pytest.mark.asyncio
-async def test_action_auth_propagates_http_error(
+@pytest.mark.parametrize("status_code", [401, 403])
+async def test_action_auth_reports_invalid_credentials_on_rejection(
+    mocker, flytbase_integration, auth_config, mock_publish_event, status_code
+):
+    """A 401/403 from FlytBase is a credential rejection: return valid_credentials
+    False rather than raising, and do not write any token state."""
+    import httpx
+
+    mock_sm = MagicMock(set_state=AsyncMock())
+    mocker.patch(
+        "app.services.flytbase.get_flytbase_token",
+        AsyncMock(side_effect=httpx.HTTPStatusError(
+            str(status_code), request=MagicMock(), response=MagicMock(status_code=status_code)
+        )),
+    )
+    mocker.patch("app.actions.handlers.state_manager", mock_sm)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+
+    result = await action_auth(integration=flytbase_integration, action_config=auth_config)
+
+    assert result["valid_credentials"] is False
+    mock_sm.set_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_action_auth_propagates_operational_errors(
     mocker, flytbase_integration, auth_config, mock_publish_event
 ):
-    """action_auth should propagate HTTP errors from get_flytbase_token."""
+    """Non-credential failures (e.g. a 5xx) are operational and must propagate so
+    the run is recorded as failed rather than as invalid credentials."""
     import httpx
 
     mocker.patch(
         "app.services.flytbase.get_flytbase_token",
-        AsyncMock(side_effect=httpx.HTTPStatusError("401", request=MagicMock(), response=MagicMock(status_code=401))),
+        AsyncMock(side_effect=httpx.HTTPStatusError(
+            "503", request=MagicMock(), response=MagicMock(status_code=503)
+        )),
     )
     mocker.patch("app.actions.handlers.state_manager", MagicMock(set_state=AsyncMock()))
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
