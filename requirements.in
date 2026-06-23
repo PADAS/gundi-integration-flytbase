@@ -4,3 +4,9 @@
 # The [asyncio_client] extra provides the async websocket transport (aiohttp,
 # already pulled transitively by gcloud-aio-pubsub, so no new conflict).
 python-socketio[asyncio_client]~=5.11
+
+# Pin httpx below 0.28: requirements are compiled fresh (no committed lock), and
+# httpx 0.28 removed the `app=` shortcut that starlette 0.27 (via fastapi 0.103)
+# passes in TestClient, breaking test collection. Remove once fastapi/starlette
+# are upgraded to a version whose TestClient uses ASGITransport.
+httpx<0.28
