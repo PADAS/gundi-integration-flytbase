@@ -135,11 +135,41 @@ class FlytBasePullObservationsConfig(PullActionConfiguration):
         description="Subscribe to {dockId}/weather channel (temperature, humidity, wind, rainfall).",
         ui_options=UIOptions(widget="checkbox"),
     )
+    collect_drone_battery: bool = FieldWithUIOptions(
+        True,
+        title="Collect Drone Battery",
+        description="Subscribe to {droneId}/battery channel. Reduced to one observation per run plus one per charging-state change.",
+        ui_options=UIOptions(widget="checkbox"),
+    )
+    collect_drone_state: bool = FieldWithUIOptions(
+        True,
+        title="Collect Drone State",
+        description="Subscribe to {droneId}/drone_state channel (connected, armed, flight mode). One observation per state change.",
+        ui_options=UIOptions(widget="checkbox"),
+    )
+    collect_drone_notifications: bool = FieldWithUIOptions(
+        True,
+        title="Collect Drone Notifications",
+        description="Subscribe to {droneId}/notification channel (alerts: level, category). One observation per notification.",
+        ui_options=UIOptions(widget="checkbox"),
+    )
+    drone_dock_map: Optional[Dict[str, str]] = FieldWithUIOptions(
+        None,
+        title="Drone-to-Dock Map",
+        description=(
+            "Optional JSON map of drone_id to dock_id. Used to geotag battery/state/"
+            "notification observations with the dock location when a drone reports no GPS "
+            "(e.g. idle in the dock). Only needed when more than one dock is configured; "
+            'with a single dock it is used automatically. Example: {"drone123": "dock456"}.'
+        ),
+    )
 
     ui_global_options = GlobalUISchemaOptions(
         order=[
             "drone_ids", "window_duration_seconds", "subject_type", "drone_name_map",
+            "collect_drone_battery", "collect_drone_state", "collect_drone_notifications",
             "dock_ids", "dock_name_map", "dock_subject_type",
             "collect_dock_state", "collect_dock_weather",
+            "drone_dock_map",
         ],
     )

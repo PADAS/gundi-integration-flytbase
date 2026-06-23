@@ -18,6 +18,11 @@ INTEGRATION_ID = "779ff3ab-5589-4f4c-9e0a-ae8d6c9edff0"
 DRONE_ID = "648f2a3d7b1c9e5f4a8d0c2e"
 
 
+def _drone_only(positions):
+    """Wrap a positions list in the collect_drone_telemetry return shape."""
+    return {DRONE_ID: {"positions": positions, "battery": [], "drone_state": [], "notification": []}}
+
+
 @pytest.fixture
 def mock_token_response_fresh():
     future = (datetime.now(timezone.utc) + timedelta(minutes=14)).isoformat()
@@ -195,8 +200,8 @@ async def test_pull_uses_cached_valid_token(
     mock_sm.set_state = AsyncMock(return_value=None)
     mocker.patch("app.actions.handlers.state_manager", mock_sm)
 
-    mock_collect = AsyncMock(return_value={DRONE_ID: sample_positions})
-    mocker.patch("app.services.flytbase.collect_drone_positions", mock_collect)
+    mock_collect = AsyncMock(return_value=_drone_only(sample_positions))
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
     mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[{}, {}]))
     mocker.patch("app.services.gundi._get_gundi_api_key", AsyncMock(return_value="fake-key"))
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
@@ -229,8 +234,8 @@ async def test_pull_reauths_when_access_token_expired(
     mock_get_token = AsyncMock(return_value=mock_token_response_fresh)
     mocker.patch("app.services.flytbase.get_flytbase_token", mock_get_token)
 
-    mock_collect = AsyncMock(return_value={DRONE_ID: sample_positions})
-    mocker.patch("app.services.flytbase.collect_drone_positions", mock_collect)
+    mock_collect = AsyncMock(return_value=_drone_only(sample_positions))
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
     mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[{}, {}]))
     mocker.patch("app.services.gundi._get_gundi_api_key", AsyncMock(return_value="fake-key"))
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
@@ -261,8 +266,8 @@ async def test_pull_full_reauth_when_both_tokens_expired(
     mock_get_token = AsyncMock(return_value=mock_token_response_fresh)
     mocker.patch("app.services.flytbase.get_flytbase_token", mock_get_token)
 
-    mock_collect = AsyncMock(return_value={DRONE_ID: sample_positions})
-    mocker.patch("app.services.flytbase.collect_drone_positions", mock_collect)
+    mock_collect = AsyncMock(return_value=_drone_only(sample_positions))
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
     mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[{}, {}]))
     mocker.patch("app.services.gundi._get_gundi_api_key", AsyncMock(return_value="fake-key"))
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
@@ -288,8 +293,8 @@ async def test_pull_sends_observations_to_gundi(
     mock_sm.set_state = AsyncMock(return_value=None)
     mocker.patch("app.actions.handlers.state_manager", mock_sm)
 
-    mock_collect = AsyncMock(return_value={DRONE_ID: sample_positions})
-    mocker.patch("app.services.flytbase.collect_drone_positions", mock_collect)
+    mock_collect = AsyncMock(return_value=_drone_only(sample_positions))
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
 
     mock_send = AsyncMock(return_value=[{}, {}])
     mocker.patch("app.actions.handlers.send_observations_to_gundi", mock_send)
@@ -321,8 +326,8 @@ async def test_pull_applies_drone_name_map(
     mock_sm.set_state = AsyncMock(return_value=None)
     mocker.patch("app.actions.handlers.state_manager", mock_sm)
 
-    mock_collect = AsyncMock(return_value={DRONE_ID: sample_positions})
-    mocker.patch("app.services.flytbase.collect_drone_positions", mock_collect)
+    mock_collect = AsyncMock(return_value=_drone_only(sample_positions))
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
 
     mock_send = AsyncMock(return_value=[{}, {}])
     mocker.patch("app.actions.handlers.send_observations_to_gundi", mock_send)
@@ -354,8 +359,8 @@ async def test_pull_filters_missing_coords(
         "rtk": {},
     }
     ts = datetime.now(timezone.utc).isoformat()
-    mock_collect = AsyncMock(return_value={DRONE_ID: [(no_coords_pos, ts), (no_coords_pos, ts)]})
-    mocker.patch("app.services.flytbase.collect_drone_positions", mock_collect)
+    mock_collect = AsyncMock(return_value=_drone_only([(no_coords_pos, ts), (no_coords_pos, ts)]))
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
 
     mock_send = AsyncMock()
     mocker.patch("app.actions.handlers.send_observations_to_gundi", mock_send)
@@ -380,8 +385,8 @@ async def test_pull_empty_window_no_crash(
     mock_sm.set_state = AsyncMock(return_value=None)
     mocker.patch("app.actions.handlers.state_manager", mock_sm)
 
-    mock_collect = AsyncMock(return_value={DRONE_ID: []})
-    mocker.patch("app.services.flytbase.collect_drone_positions", mock_collect)
+    mock_collect = AsyncMock(return_value=_drone_only([]))
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
 
     mock_send = AsyncMock()
     mocker.patch("app.actions.handlers.send_observations_to_gundi", mock_send)
@@ -412,6 +417,9 @@ def pull_config_with_docks():
         dock_subject_type="dock",
         collect_dock_state=True,
         collect_dock_weather=True,
+        collect_drone_battery=True,
+        collect_drone_state=True,
+        collect_drone_notifications=True,
     )
 
 
@@ -445,7 +453,7 @@ def _setup_pull_mocks(mocker, mock_publish_event, valid_token_state,
     mocker.patch("app.actions.handlers.state_manager", mock_sm)
 
     mock_drone_collect = AsyncMock(return_value=drone_collect_return)
-    mocker.patch("app.services.flytbase.collect_drone_positions", mock_drone_collect)
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_drone_collect)
 
     mock_dock_collect = AsyncMock(return_value=dock_collect_return or {})
     mocker.patch("app.services.flytbase.collect_dock_telemetry", mock_dock_collect)
@@ -466,7 +474,7 @@ async def test_pull_skips_dock_collection_when_no_dock_ids(
     """collect_dock_telemetry should NOT be called when dock_ids is not set."""
     mock_drone_collect, mock_dock_collect, _ = _setup_pull_mocks(
         mocker, mock_publish_event, valid_token_state,
-        drone_collect_return={DRONE_ID: sample_positions},
+        drone_collect_return=_drone_only(sample_positions),
     )
 
     await action_pull_observations(integration=flytbase_integration, action_config=pull_config)
@@ -483,7 +491,7 @@ async def test_pull_collects_dock_telemetry_when_dock_ids_configured(
     """collect_dock_telemetry should be called when dock_ids is configured."""
     mock_drone_collect, mock_dock_collect, _ = _setup_pull_mocks(
         mocker, mock_publish_event, valid_token_state,
-        drone_collect_return={DRONE_ID: sample_positions},
+        drone_collect_return=_drone_only(sample_positions),
         dock_collect_return=sample_dock_telemetry,
     )
 
@@ -506,7 +514,7 @@ async def test_pull_sends_dock_state_observations(
     """Dock state messages should be transformed and included in the Gundi send."""
     _, _, mock_send = _setup_pull_mocks(
         mocker, mock_publish_event, valid_token_state,
-        drone_collect_return={DRONE_ID: []},
+        drone_collect_return=_drone_only([]),
         dock_collect_return=sample_dock_telemetry,
     )
 
@@ -535,7 +543,7 @@ async def test_pull_sends_dock_weather_observations(
     """Dock weather messages should be transformed and included in the Gundi send."""
     _, _, mock_send = _setup_pull_mocks(
         mocker, mock_publish_event, valid_token_state,
-        drone_collect_return={DRONE_ID: []},
+        drone_collect_return=_drone_only([]),
         dock_collect_return=sample_dock_telemetry,
     )
 
@@ -571,7 +579,7 @@ async def test_pull_skips_dock_obs_without_location(
 
     _, _, mock_send = _setup_pull_mocks(
         mocker, mock_publish_event, valid_token_state,
-        drone_collect_return={DRONE_ID: []},
+        drone_collect_return=_drone_only([]),
         dock_collect_return=no_location_dock,
     )
 
@@ -581,3 +589,50 @@ async def test_pull_skips_dock_obs_without_location(
 
     assert result["observations_extracted"] == 0
     mock_send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pull_sends_reduced_battery_state_notification_with_dock_fallback(
+    mocker, flytbase_integration, pull_config_with_docks, mock_publish_event,
+    valid_token_state, sample_dock_telemetry
+):
+    """Battery/state/notification are reduced and geotagged; with no drone GPS the
+    single configured dock's location is used as the fallback."""
+    ts = datetime.now(timezone.utc).isoformat()
+    drone_return = {
+        DRONE_ID: {
+            "positions": [],  # no GPS -> dock fallback
+            "battery": [
+                ({"total_percentage": 80, "charging_state": 1}, ts),
+                ({"total_percentage": 82, "charging_state": 1}, ts),
+            ],
+            "drone_state": [
+                ({"connected": True, "armed": False, "mode": {"state": 0}, "drone_state": 0}, ts),
+                ({"connected": True, "armed": True, "mode": {"state": 1}, "drone_state": 1}, ts),
+            ],
+            "notification": [({"level": "warning", "category": "battery"}, ts)],
+        }
+    }
+    _, _, mock_send = _setup_pull_mocks(
+        mocker, mock_publish_event, valid_token_state,
+        drone_collect_return=drone_return,
+        dock_collect_return=sample_dock_telemetry,
+    )
+
+    await action_pull_observations(
+        integration=flytbase_integration, action_config=pull_config_with_docks
+    )
+
+    sent = mock_send.call_args.kwargs["observations"]
+    by_type = {}
+    for o in sent:
+        t = o.get("additional", {}).get("telemetry_type")
+        by_type.setdefault(t, []).append(o)
+    # 1 battery (single charging-state segment), 2 drone_state (two distinct states), 1 notification
+    assert len(by_type["battery"]) == 1
+    assert by_type["battery"][0]["additional"]["battery_percentage"] == 81.0
+    assert len(by_type["drone_state"]) == 2
+    assert len(by_type["notification"]) == 1
+    # All geotagged with the dock's fallback location
+    for o in by_type["battery"] + by_type["drone_state"] + by_type["notification"]:
+        assert o["location"] == {"lat": 18.5628, "lon": 73.7010}

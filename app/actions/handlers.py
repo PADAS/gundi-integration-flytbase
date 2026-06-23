@@ -75,12 +75,15 @@ async def action_pull_observations(integration, action_config: FlytBasePullObser
     server_region = auth_data.get("server_region", "US")
 
     # ── Step 3: Collect positions via Socket.IO (drone + dock in parallel) ──────
-    drone_task = flytbase.collect_drone_positions(
+    drone_task = flytbase.collect_drone_telemetry(
         access_token=access_token,
         org_id=org_id,
         drone_ids=action_config.drone_ids,
         server_region=server_region,
         window_seconds=action_config.window_duration_seconds,
+        collect_battery=action_config.collect_drone_battery,
+        collect_drone_state=action_config.collect_drone_state,
+        collect_notifications=action_config.collect_drone_notifications,
     )
     if action_config.dock_ids:
         dock_task = flytbase.collect_dock_telemetry(
@@ -101,9 +104,22 @@ async def action_pull_observations(integration, action_config: FlytBasePullObser
     drone_name_map = action_config.drone_name_map or {}
     observations = []
 
-    for drone_id, messages in collected.items():
+    for drone_id, drone_data in collected.items():
         drone_name = drone_name_map.get(drone_id)
-        for position_data, recorded_at in messages:
+
+        # Window-average location for this drone's non-positional telemetry, with a
+        # dock-location fallback when the drone reported no GPS during the window.
+        loc = flytbase.average_location(drone_data["positions"])
+        if loc is None:
+            dock_id = flytbase.resolve_dock_for_drone(
+                drone_id, action_config.dock_ids, action_config.drone_dock_map
+            )
+            dock_entry = dock_collected.get(dock_id) if dock_id else None
+            loc = dock_entry["dock_location"] if dock_entry else None
+        avg_lat, avg_lon = loc if loc else (None, None)
+
+        # Positions — full per-reading fidelity, each with its own coordinates.
+        for position_data, recorded_at in drone_data["positions"]:
             obs = flytbase.transform_position_to_observation(
                 drone_id=drone_id,
                 position_data=position_data,
@@ -113,6 +129,51 @@ async def action_pull_observations(integration, action_config: FlytBasePullObser
             )
             if obs is not None:
                 observations.append(obs)
+
+        # Battery — reduced to one per charging-state segment (averaged %).
+        if action_config.collect_drone_battery:
+            for battery_data, recorded_at in flytbase.reduce_battery(drone_data["battery"]):
+                obs = flytbase.transform_battery_to_observation(
+                    drone_id=drone_id,
+                    battery_data=battery_data,
+                    recorded_at=recorded_at,
+                    lat=avg_lat,
+                    lon=avg_lon,
+                    subject_type=action_config.subject_type,
+                    drone_name=drone_name,
+                )
+                if obs is not None:
+                    observations.append(obs)
+
+        # Drone state — reduced to one per state transition.
+        if action_config.collect_drone_state:
+            for state_data, recorded_at in flytbase.reduce_drone_state(drone_data["drone_state"]):
+                obs = flytbase.transform_drone_state_to_observation(
+                    drone_id=drone_id,
+                    state_data=state_data,
+                    recorded_at=recorded_at,
+                    lat=avg_lat,
+                    lon=avg_lon,
+                    subject_type=action_config.subject_type,
+                    drone_name=drone_name,
+                )
+                if obs is not None:
+                    observations.append(obs)
+
+        # Notifications — one observation per event.
+        if action_config.collect_drone_notifications:
+            for notif_data, recorded_at in drone_data["notification"]:
+                obs = flytbase.transform_notification_to_observation(
+                    drone_id=drone_id,
+                    notification_data=notif_data,
+                    recorded_at=recorded_at,
+                    lat=avg_lat,
+                    lon=avg_lon,
+                    subject_type=action_config.subject_type,
+                    drone_name=drone_name,
+                )
+                if obs is not None:
+                    observations.append(obs)
 
     dock_name_map = action_config.dock_name_map or {}
     for dock_id, dock_data in dock_collected.items():
