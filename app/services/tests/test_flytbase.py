@@ -1,10 +1,19 @@
 import asyncio
+import base64
+import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from app.services import flytbase
+
+
+def _make_jwt(exp: int) -> str:
+    """Builds an unsigned JWT carrying a given exp claim (for expiry-parsing tests)."""
+    def seg(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+    return f"{seg({'alg': 'none'})}.{seg({'exp': exp})}.sig"
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -59,11 +68,11 @@ def sample_position_missing_coords():
 
 @pytest.fixture
 def mock_token_response():
-    future = (datetime.now(timezone.utc) + timedelta(minutes=14)).isoformat()
-    refresh_future = (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()
+    # FlytBase returns lifetimes as `expires_in` (seconds), not an absolute time —
+    # see flytbase.get_token_expiry. 14 min access / 6 day refresh.
     return {
-        "access": {"token": "test-access-token", "expiry": future},
-        "refresh": {"token": "test-refresh-token", "expiry": refresh_future},
+        "access": {"token": "test-access-token", "expires_in": 14 * 60},
+        "refresh": {"token": "test-refresh-token", "expires_in": 6 * 24 * 60 * 60},
     }
 
 
@@ -76,7 +85,7 @@ async def test_get_flytbase_token_success(mocker, mock_token_response):
     mock_response.raise_for_status = MagicMock()
 
     mock_client = AsyncMock()
-    mock_client.__aenter__.return_value.post = AsyncMock(return_value=mock_response)
+    mock_client.__aenter__.return_value.get = AsyncMock(return_value=mock_response)
     mocker.patch("app.services.flytbase.httpx.AsyncClient", return_value=mock_client)
 
     result = await flytbase.get_flytbase_token("my-client-id", "my-secret")
@@ -87,7 +96,7 @@ async def test_get_flytbase_token_success(mocker, mock_token_response):
     # Verify Basic auth header was constructed correctly
     import base64
     expected_b64 = base64.b64encode(b"my-client-id:my-secret").decode()
-    call_kwargs = mock_client.__aenter__.return_value.post.call_args
+    call_kwargs = mock_client.__aenter__.return_value.get.call_args
     assert f"Basic {expected_b64}" in str(call_kwargs)
 
 
@@ -103,11 +112,48 @@ async def test_get_flytbase_token_raises_on_http_error(mocker):
     )
 
     mock_client = AsyncMock()
-    mock_client.__aenter__.return_value.post = AsyncMock(return_value=mock_response)
+    mock_client.__aenter__.return_value.get = AsyncMock(return_value=mock_response)
     mocker.patch("app.services.flytbase.httpx.AsyncClient", return_value=mock_client)
 
     with pytest.raises(httpx.HTTPStatusError):
         await flytbase.get_flytbase_token("bad-id", "bad-secret")
+
+
+@pytest.mark.asyncio
+async def test_get_flytbase_token_uses_base_url(mocker, mock_token_response):
+    """The token request hits <base_url>/oauth/token, not a hardcoded host."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = mock_token_response
+    mock_response.raise_for_status = MagicMock()
+
+    mock_get = AsyncMock(return_value=mock_response)
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value.get = mock_get
+    mocker.patch("app.services.flytbase.httpx.AsyncClient", return_value=mock_client)
+
+    await flytbase.get_flytbase_token("id", "secret", base_url="https://api-eu.flytbase.com")
+
+    requested_url = mock_get.call_args.args[0]
+    assert requested_url == "https://api-eu.flytbase.com/oauth/token"
+
+
+# ── URL derivation ────────────────────────────────────────────────────────────
+
+def test_token_url_for_appends_oauth_path():
+    assert flytbase.token_url_for("https://api.flytbase.com") == "https://api.flytbase.com/oauth/token"
+
+
+def test_token_url_for_strips_trailing_slash():
+    assert flytbase.token_url_for("https://api.flytbase.com/") == "https://api.flytbase.com/oauth/token"
+
+
+def test_socket_url_for_swaps_https_to_wss():
+    assert flytbase.socket_url_for("https://api.flytbase.com") == "wss://api.flytbase.com"
+    assert flytbase.socket_url_for("https://api-eu.flytbase.com") == "wss://api-eu.flytbase.com"
+
+
+def test_socket_url_for_swaps_http_to_ws():
+    assert flytbase.socket_url_for("http://localhost:8080") == "ws://localhost:8080"
 
 
 # ── Token expiry checks ───────────────────────────────────────────────────────
@@ -141,6 +187,48 @@ def test_is_token_expired_custom_buffer():
     # 30 seconds from now, buffer=0 → not expired
     soon = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
     assert flytbase.is_token_expired(soon, buffer_seconds=0) is False
+
+
+# ── Token expiry derivation (get_token_expiry) ────────────────────────────────
+
+def test_get_token_expiry_from_expires_in():
+    """FlytBase returns expires_in (seconds); expiry should be now + expires_in."""
+    iso = flytbase.get_token_expiry({"token": "x", "expires_in": 900})
+    assert iso is not None
+    delta = (datetime.fromisoformat(iso) - datetime.now(timezone.utc)).total_seconds()
+    assert 880 < delta <= 900
+
+
+def test_get_token_expiry_falls_back_to_jwt_exp():
+    """With no expires_in, expiry comes from the JWT exp claim."""
+    exp = int((datetime.now(timezone.utc) + timedelta(minutes=15)).timestamp())
+    iso = flytbase.get_token_expiry({"token": _make_jwt(exp)})
+    assert iso is not None
+    assert datetime.fromisoformat(iso) == datetime.fromtimestamp(exp, timezone.utc)
+
+
+def test_get_token_expiry_falls_back_to_absolute_expiry_field():
+    """If the API instead returns an absolute `expiry` (ISO string or unix ts),
+    that is used when neither expires_in nor a JWT exp is available."""
+    future = datetime.now(timezone.utc) + timedelta(minutes=15)
+    iso = flytbase.get_token_expiry({"token": "not-a-jwt", "expiry": future.isoformat()})
+    assert datetime.fromisoformat(iso) == future
+    ts = int(future.timestamp())
+    iso_from_ts = flytbase.get_token_expiry({"token": "not-a-jwt", "expiry": ts})
+    assert datetime.fromisoformat(iso_from_ts) == datetime.fromtimestamp(ts, timezone.utc)
+
+
+def test_get_token_expiry_naive_expiry_string_treated_as_utc():
+    """A naive ISO `expiry` (no tzinfo) is interpreted as UTC, not local time."""
+    iso = flytbase.get_token_expiry({"token": "x", "expiry": "2099-01-01T00:00:00"})
+    assert iso == "2099-01-01T00:00:00+00:00"
+
+
+def test_get_token_expiry_none_when_no_info():
+    assert flytbase.get_token_expiry({"token": "not-a-jwt"}) is None
+    assert flytbase.get_token_expiry({}) is None
+    assert flytbase.get_token_expiry({"token": None}) is None
+    assert flytbase.get_token_expiry({"token": "x", "expiry": "garbage"}) is None
 
 
 # ── Observation transformation ────────────────────────────────────────────────
@@ -255,18 +343,18 @@ async def test_collect_connects_with_correct_auth(mocker):
     mock_sio.connect = connect_and_fire
     mocker.patch("asyncio.sleep", new_callable=AsyncMock)
 
-    await flytbase.collect_drone_positions(
+    await flytbase.collect_drone_telemetry(
         access_token="test-token",
         org_id="test-org-id",
         drone_ids=[DRONE_ID],
-        server_region="US",
+        base_url="https://api.flytbase.com",
         window_seconds=1,
     )
 
     original_connect.assert_called_once()
     call_kwargs = original_connect.call_args.kwargs
     assert call_kwargs["auth"]["authorization"] == "Bearer test-token"
-    assert call_kwargs["auth"]["orgId"] == "test-org-id"
+    assert call_kwargs["auth"]["org-id"] == "test-org-id"
     assert call_kwargs["transports"] == ["websocket"]
     assert "api.flytbase.com" in original_connect.call_args.args[0]
 
@@ -305,16 +393,19 @@ async def test_collect_registers_handler_per_drone(mocker):
     mocker.patch("asyncio.sleep", new_callable=AsyncMock)
 
     drone_ids = ["drone-001", "drone-002", "drone-003"]
-    await flytbase.collect_drone_positions(
+    await flytbase.collect_drone_telemetry(
         access_token="tok",
         org_id="org",
         drone_ids=drone_ids,
-        server_region="US",
+        base_url="https://api.flytbase.com",
         window_seconds=1,
     )
 
     for did in drone_ids:
         assert f"{did}/global_position" in registered_channels
+        assert f"{did}/battery" in registered_channels
+        assert f"{did}/drone_state" in registered_channels
+        assert f"{did}/notification" in registered_channels
 
 
 @pytest.mark.asyncio
@@ -345,20 +436,257 @@ async def test_collect_returns_empty_when_no_messages(mocker):
     mock_sio.connect = connect_and_fire
     mocker.patch("asyncio.sleep", new_callable=AsyncMock)
 
-    result = await flytbase.collect_drone_positions(
+    result = await flytbase.collect_drone_telemetry(
         access_token="tok",
         org_id="org",
         drone_ids=[DRONE_ID],
-        server_region="EU",
+        base_url="https://api-eu.flytbase.com",
         window_seconds=1,
     )
 
     assert isinstance(result, dict)
     assert DRONE_ID in result
-    assert result[DRONE_ID] == []
-    # EU server URL used
+    assert result[DRONE_ID] == {"positions": [], "battery": [], "drone_state": [], "notification": []}
     original_connect.assert_called_once()
     assert "api-eu.flytbase.com" in original_connect.call_args.args[0]
+
+
+# ── Subscribe emit + payload unwrapping ───────────────────────────────────────
+
+def test_unwrap_passthrough_and_array():
+    """_unwrap returns dicts as-is and unwraps single-element array payloads."""
+    payload = {"position": {"latitude": 1.0}}
+    assert flytbase._unwrap(payload) is payload
+    assert flytbase._unwrap([payload]) is payload
+    assert flytbase._unwrap([]) == {}
+
+
+@pytest.mark.asyncio
+async def test_collect_emits_subscribe_per_drone(mocker):
+    """After connecting, a 'Subscribe' {topic} emit must be sent per channel."""
+    mock_sio = AsyncMock()
+    mock_sio.connected = True
+    mock_sio.connect = AsyncMock()
+    mock_sio.disconnect = AsyncMock()
+
+    registered_events = {}
+
+    def fake_event(func):
+        registered_events[func.__name__] = func
+        return func
+
+    mock_sio.event = fake_event
+    mock_sio.on = MagicMock()
+
+    mocker.patch("app.services.flytbase.socketio.AsyncClient", return_value=mock_sio)
+
+    original_connect = mock_sio.connect
+
+    async def connect_and_fire(*args, **kwargs):
+        await original_connect(*args, **kwargs)
+        if "connect" in registered_events:
+            await registered_events["connect"]()
+
+    mock_sio.connect = connect_and_fire
+    mocker.patch("asyncio.sleep", new_callable=AsyncMock)
+
+    drone_ids = ["drone-001", "drone-002"]
+    await flytbase.collect_drone_telemetry(
+        access_token="tok",
+        org_id="org",
+        drone_ids=drone_ids,
+        base_url="https://api.flytbase.com",
+        window_seconds=1,
+    )
+
+    subscribe_calls = [c for c in mock_sio.emit.call_args_list if c.args and c.args[0] == "Subscribe"]
+    subscribed_topics = {c.args[1]["topic"] for c in subscribe_calls}
+    expected = set()
+    for d in drone_ids:
+        expected.update({f"{d}/global_position", f"{d}/battery", f"{d}/drone_state", f"{d}/notification"})
+    assert subscribed_topics == expected
+
+
+@pytest.mark.asyncio
+async def test_collect_unwraps_array_wrapped_payload(mocker, sample_position_full):
+    """A payload delivered as [ {...} ] is unwrapped before being stored."""
+    registered_events = {}
+    registered_channels_map = {}
+
+    mock_sio = AsyncMock()
+    mock_sio.connected = True
+    mock_sio.connect = AsyncMock()
+    mock_sio.disconnect = AsyncMock()
+
+    def fake_event(func):
+        registered_events[func.__name__] = func
+        return func
+
+    def fake_on(channel, handler):
+        registered_channels_map[channel] = handler
+
+    mock_sio.event = fake_event
+    mock_sio.on = fake_on
+    mocker.patch("app.services.flytbase.socketio.AsyncClient", return_value=mock_sio)
+
+    original_connect = mock_sio.connect
+
+    async def connect_and_fire(*args, **kwargs):
+        await original_connect(*args, **kwargs)
+        if "connect" in registered_events:
+            await registered_events["connect"]()
+        # Server wraps the payload in a single-element array on this topic.
+        await registered_channels_map[f"{DRONE_ID}/global_position"]([sample_position_full])
+
+    mock_sio.connect = connect_and_fire
+    mocker.patch("asyncio.sleep", new_callable=AsyncMock)
+
+    result = await flytbase.collect_drone_telemetry(
+        access_token="tok",
+        org_id="org",
+        drone_ids=[DRONE_ID],
+        base_url="https://api.flytbase.com",
+        window_seconds=1,
+    )
+
+    assert len(result[DRONE_ID]["positions"]) == 1
+    stored, _ = result[DRONE_ID]["positions"][0]
+    assert stored == sample_position_full
+
+
+@pytest.mark.asyncio
+async def test_collect_telemetry_only_subscribes_enabled_channels(mocker):
+    mock_sio = AsyncMock()
+    mock_sio.connected = True
+    mock_sio.connect = AsyncMock()
+    mock_sio.disconnect = AsyncMock()
+
+    registered_events = {}
+
+    def fake_event(func):
+        registered_events[func.__name__] = func
+        return func
+
+    mock_sio.event = fake_event
+    registered_channels = []
+
+    def fake_on(channel, handler):
+        registered_channels.append(channel)
+
+    mock_sio.on = fake_on
+    mocker.patch("app.services.flytbase.socketio.AsyncClient", return_value=mock_sio)
+
+    original_connect = mock_sio.connect
+
+    async def connect_and_fire(*args, **kwargs):
+        await original_connect(*args, **kwargs)
+        if "connect" in registered_events:
+            await registered_events["connect"]()
+
+    mock_sio.connect = connect_and_fire
+    mocker.patch("asyncio.sleep", new_callable=AsyncMock)
+
+    await flytbase.collect_drone_telemetry(
+        access_token="tok", org_id="org", drone_ids=[DRONE_ID],
+        base_url="https://api.flytbase.com", window_seconds=1,
+        collect_battery=True, collect_drone_state=False, collect_notifications=False,
+    )
+
+    topics = {c.args[1]["topic"] for c in mock_sio.emit.call_args_list if c.args and c.args[0] == "Subscribe"}
+    assert topics == {f"{DRONE_ID}/global_position", f"{DRONE_ID}/battery"}
+    assert f"{DRONE_ID}/global_position" in registered_channels
+    assert f"{DRONE_ID}/battery" in registered_channels
+    assert f"{DRONE_ID}/drone_state" not in registered_channels
+    assert f"{DRONE_ID}/notification" not in registered_channels
+
+
+def test_average_location_means_coords():
+    positions = [
+        ({"position": {"latitude": 10.0, "longitude": 20.0}}, "t1"),
+        ({"position": {"latitude": 12.0, "longitude": 24.0}}, "t2"),
+    ]
+    assert flytbase.average_location(positions) == (11.0, 22.0)
+
+
+def test_average_location_skips_missing_and_empty():
+    positions = [
+        ({"position": {"latitude": None, "longitude": None}}, "t1"),
+        ({"position": {"latitude": 10.0, "longitude": 20.0}}, "t2"),
+    ]
+    assert flytbase.average_location(positions) == (10.0, 20.0)
+    assert flytbase.average_location([]) is None
+    assert flytbase.average_location([({"position": {}}, "t")]) is None
+
+
+def test_reduce_drone_state_collapses_consecutive_identical():
+    s_idle = {"connected": True, "armed": False, "mode": {"state": 0}, "drone_state": 0}
+    s_armed = {"connected": True, "armed": True, "mode": {"state": 1}, "drone_state": 1}
+    readings = [
+        (s_idle, "t1"), (s_idle, "t2"), (s_armed, "t3"), (s_armed, "t4"), (s_idle, "t5"),
+    ]
+    reduced = flytbase.reduce_drone_state(readings)
+    assert [ra for _, ra in reduced] == ["t1", "t3", "t5"]
+    assert [p["drone_state"] for p, _ in reduced] == [0, 1, 0]
+
+
+def test_reduce_drone_state_empty_and_single():
+    assert flytbase.reduce_drone_state([]) == []
+    one = [({"connected": True, "armed": False, "mode": {"state": 0}, "drone_state": 0}, "t1")]
+    assert len(flytbase.reduce_drone_state(one)) == 1
+
+
+def test_reduce_battery_dedups_charging_state_and_averages_pct():
+    readings = [
+        ({"total_percentage": 80, "charging_state": 1}, "t1"),
+        ({"total_percentage": 82, "charging_state": 1}, "t2"),
+        ({"total_percentage": 90, "charging_state": 0}, "t3"),
+    ]
+    reduced = flytbase.reduce_battery(readings)
+    assert len(reduced) == 2
+    p0, ra0 = reduced[0]
+    assert ra0 == "t1"
+    assert p0["charging_state"] == 1
+    assert p0["total_percentage"] == 81.0  # mean(80, 82)
+    p1, ra1 = reduced[1]
+    assert ra1 == "t3"
+    assert p1["total_percentage"] == 90
+
+
+def test_reduce_battery_empty():
+    assert flytbase.reduce_battery([]) == []
+
+
+def test_resolve_dock_for_drone_map_priority():
+    assert flytbase.resolve_dock_for_drone("d1", ["dockA", "dockB"], {"d1": "dockB"}) == "dockB"
+
+
+def test_resolve_dock_for_drone_single_dock_auto():
+    assert flytbase.resolve_dock_for_drone("d1", ["dockA"], None) == "dockA"
+
+
+def test_resolve_dock_for_drone_none_when_ambiguous():
+    assert flytbase.resolve_dock_for_drone("d1", ["dockA", "dockB"], None) is None
+    assert flytbase.resolve_dock_for_drone("d1", None, None) is None
+
+
+def test_reduce_battery_all_none_pct_preserves_first_payload():
+    readings = [
+        ({"total_percentage": None, "charging_state": 1}, "t1"),
+        ({"total_percentage": None, "charging_state": 1}, "t2"),
+    ]
+    reduced = flytbase.reduce_battery(readings)
+    assert len(reduced) == 1
+    assert reduced[0][0]["total_percentage"] is None
+
+
+def test_reduce_drone_state_consecutive_empty_dicts_collapse():
+    reduced = flytbase.reduce_drone_state([({}, "t1"), ({}, "t2")])
+    assert len(reduced) == 1
+    assert reduced[0][1] == "t1"
+
+
+def test_resolve_dock_for_drone_map_miss_falls_back_to_single_dock():
+    assert flytbase.resolve_dock_for_drone("d2", ["dockA"], {"d1": "dockX"}) == "dockA"
 
 
 # ── Dock telemetry fixtures ───────────────────────────────────────────────────
@@ -448,14 +776,14 @@ async def test_collect_dock_telemetry_connects_with_correct_auth(mocker):
         access_token="dock-token",
         org_id="org-123",
         dock_ids=[DOCK_ID],
-        server_region="US",
+        base_url="https://api.flytbase.com",
         window_seconds=1,
     )
 
     original_connect.assert_called_once()
     call_kwargs = original_connect.call_args.kwargs
     assert call_kwargs["auth"]["authorization"] == "Bearer dock-token"
-    assert call_kwargs["auth"]["orgId"] == "org-123"
+    assert call_kwargs["auth"]["org-id"] == "org-123"
     assert call_kwargs["transports"] == ["websocket"]
     assert "api.flytbase.com" in original_connect.call_args.args[0]
 
@@ -472,7 +800,7 @@ async def test_collect_dock_telemetry_registers_channels_per_dock(mocker):
         access_token="tok",
         org_id="org",
         dock_ids=dock_ids,
-        server_region="US",
+        base_url="https://api.flytbase.com",
         window_seconds=1,
     )
 
@@ -522,7 +850,7 @@ async def test_collect_dock_telemetry_captures_dock_location(mocker, sample_dock
         access_token="tok",
         org_id="org",
         dock_ids=[DOCK_ID],
-        server_region="US",
+        base_url="https://api.flytbase.com",
         window_seconds=1,
     )
 
@@ -540,7 +868,7 @@ async def test_collect_dock_telemetry_skips_channels_when_disabled(mocker):
         access_token="tok",
         org_id="org",
         dock_ids=[DOCK_ID],
-        server_region="US",
+        base_url="https://api.flytbase.com",
         window_seconds=1,
         collect_dock_state=False,
         collect_dock_weather=False,
@@ -549,6 +877,32 @@ async def test_collect_dock_telemetry_skips_channels_when_disabled(mocker):
     assert f"{DOCK_ID}/global_position" in registered_channels
     assert f"{DOCK_ID}/dock_state" not in registered_channels
     assert f"{DOCK_ID}/weather" not in registered_channels
+
+
+@pytest.mark.asyncio
+async def test_collect_dock_emits_subscribe_for_enabled_channels(mocker):
+    """Subscribe emits cover global_position plus only the enabled dock channels."""
+    registered_events = {}
+    registered_channels = []
+    mock_sio, _ = _make_dock_sio_mock(mocker, registered_events, registered_channels)
+    mocker.patch("asyncio.sleep", new_callable=AsyncMock)
+
+    await flytbase.collect_dock_telemetry(
+        access_token="tok",
+        org_id="org",
+        dock_ids=[DOCK_ID],
+        base_url="https://api.flytbase.com",
+        window_seconds=1,
+        collect_dock_state=True,
+        collect_dock_weather=False,
+    )
+
+    subscribe_topics = {
+        c.args[1]["topic"]
+        for c in mock_sio.emit.call_args_list
+        if c.args and c.args[0] == "Subscribe"
+    }
+    assert subscribe_topics == {f"{DOCK_ID}/global_position", f"{DOCK_ID}/dock_state"}
 
 
 @pytest.mark.asyncio
@@ -562,7 +916,7 @@ async def test_collect_dock_telemetry_returns_empty_when_no_messages(mocker):
         access_token="tok",
         org_id="org",
         dock_ids=[DOCK_ID],
-        server_region="EU",
+        base_url="https://api-eu.flytbase.com",
         window_seconds=1,
     )
 
@@ -698,3 +1052,92 @@ def test_transform_dock_weather_missing_nested_dicts():
     assert obs is not None
     assert obs["additional"]["humidity_pct"] is None
     assert obs["additional"]["wind_speed_ms"] is None
+
+
+# ── Drone battery / state / notification transforms ───────────────────────────
+
+def test_transform_battery_full():
+    obs = flytbase.transform_battery_to_observation(
+        drone_id=DRONE_ID, battery_data={"total_percentage": 81.0, "charging_state": 1},
+        recorded_at=RECORDED_AT, lat=10.0, lon=20.0, subject_type="drone", drone_name="Alpha 1",
+    )
+    assert obs["source"] == DRONE_ID
+    assert obs["source_name"] == "Alpha 1"
+    assert obs["subject_type"] == "drone"
+    assert obs["recorded_at"] == RECORDED_AT
+    assert obs["location"] == {"lat": 10.0, "lon": 20.0}
+    assert obs["additional"]["telemetry_type"] == "battery"
+    assert obs["additional"]["battery_percentage"] == 81.0
+    assert obs["additional"]["charging_state"] == 1
+
+
+def test_transform_battery_default_source_name_and_missing_location():
+    obs = flytbase.transform_battery_to_observation(
+        DRONE_ID, {"total_percentage": 50, "charging_state": 0}, RECORDED_AT, 10.0, 20.0,
+    )
+    assert obs["source_name"] == DRONE_ID
+    assert flytbase.transform_battery_to_observation(
+        DRONE_ID, {"total_percentage": 50}, RECORDED_AT, None, 20.0,
+    ) is None
+    assert flytbase.transform_battery_to_observation(
+        DRONE_ID, {"total_percentage": 50}, RECORDED_AT, 10.0, None,
+    ) is None
+
+
+def test_transform_drone_state_full():
+    obs = flytbase.transform_drone_state_to_observation(
+        drone_id=DRONE_ID,
+        state_data={"connected": True, "armed": True, "mode": {"state": 2}, "drone_state": 1},
+        recorded_at=RECORDED_AT, lat=10.0, lon=20.0,
+    )
+    assert obs["source"] == DRONE_ID
+    assert obs["source_name"] == DRONE_ID
+    assert obs["location"] == {"lat": 10.0, "lon": 20.0}
+    assert obs["additional"]["telemetry_type"] == "drone_state"
+    assert obs["additional"]["connected"] is True
+    assert obs["additional"]["armed"] is True
+    assert obs["additional"]["mode_state"] == 2
+    assert obs["additional"]["drone_state"] == 1
+
+
+def test_transform_drone_state_missing_location_and_nested():
+    assert flytbase.transform_drone_state_to_observation(
+        DRONE_ID, {"connected": True}, RECORDED_AT, 10.0, None,
+    ) is None
+    assert flytbase.transform_drone_state_to_observation(
+        DRONE_ID, {"connected": True}, RECORDED_AT, None, 20.0,
+    ) is None
+    # Missing mode sub-dict must not raise:
+    obs = flytbase.transform_drone_state_to_observation(
+        DRONE_ID, {"connected": False, "drone_state": 0}, RECORDED_AT, 10.0, 20.0,
+    )
+    assert obs["additional"]["mode_state"] is None
+
+
+def test_transform_notification_full():
+    obs = flytbase.transform_notification_to_observation(
+        drone_id=DRONE_ID,
+        notification_data={"level": "warning", "category": "battery", "message": "low", "code": 42},
+        recorded_at=RECORDED_AT, lat=10.0, lon=20.0,
+    )
+    assert obs["source"] == DRONE_ID
+    assert obs["location"] == {"lat": 10.0, "lon": 20.0}
+    assert obs["additional"]["telemetry_type"] == "notification"
+    assert obs["additional"]["level"] == "warning"
+    assert obs["additional"]["category"] == "battery"
+    assert obs["additional"]["message"] == "low"
+    assert obs["additional"]["code"] == 42
+
+
+def test_transform_notification_minimal_and_missing_location():
+    obs = flytbase.transform_notification_to_observation(
+        DRONE_ID, {"level": "info", "category": "system"}, RECORDED_AT, 10.0, 20.0,
+    )
+    assert "message" not in obs["additional"]
+    assert "code" not in obs["additional"]
+    assert flytbase.transform_notification_to_observation(
+        DRONE_ID, {"level": "info"}, RECORDED_AT, None, None,
+    ) is None
+    assert flytbase.transform_notification_to_observation(
+        DRONE_ID, {"level": "info"}, RECORDED_AT, 10.0, None,
+    ) is None

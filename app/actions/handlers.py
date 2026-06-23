@@ -30,17 +30,13 @@ async def action_auth(integration, action_config: FlytBaseAuthConfig):
     token_response = await flytbase.get_flytbase_token(
         client_id=action_config.client_id,
         client_secret=action_config.client_secret.get_secret_value(),
+        base_url=action_config.base_url,
     )
 
     await state_manager.set_state(
         integration_id=integration_id,
         action_id="auth",
-        state={
-            "access_token": token_response["access"]["token"],
-            "access_token_expiry": token_response["access"].get("expiry"),
-            "refresh_token": token_response["refresh"]["token"],
-            "refresh_token_expiry": token_response["refresh"].get("expiry"),
-        },
+        state=_token_state_from_response(token_response),
     )
 
     logger.info(f"FlytBase tokens stored for integration {integration_id}")
@@ -51,14 +47,16 @@ async def action_auth(integration, action_config: FlytBaseAuthConfig):
 @crontab_schedule("*/5 * * * *")  # Every 5 minutes
 async def action_pull_observations(integration, action_config: FlytBasePullObservationsConfig):
     """
-    Connects to FlytBase Socket.IO, subscribes to each configured drone's
-    global_position channel, collects position messages for window_duration_seconds,
+    Connects to FlytBase Socket.IO and, for each configured drone, subscribes to
+    global_position plus (per the collect_* flags) battery, drone_state, and
+    notification channels; for each configured dock, subscribes to global_position
+    plus dock_state and weather. Collects messages for window_duration_seconds,
     transforms them into Gundi Observations, and sends them in batches.
 
-    Token refresh decision:
-      1. Use cached access token if not expiring within 2 min.
-      2. Refresh using refresh token if available and not expired.
-      3. Fall back to full re-authentication using auth action credentials.
+    Access token handling (see _get_valid_access_token):
+      1. Use the cached access token if it is not expiring within 2 min.
+      2. Otherwise re-authenticate with the stored client credentials. FlytBase
+         has no usable refresh grant, so "refresh" is a full re-auth.
     """
     integration_id = str(integration.id)
     logger.info(
@@ -77,22 +75,25 @@ async def action_pull_observations(integration, action_config: FlytBasePullObser
             "Please configure and run the 'auth' action first."
         )
     org_id = auth_data["org_id"]
-    server_region = auth_data.get("server_region", "US")
+    base_url = auth_data.get("base_url") or flytbase.FLYTBASE_DEFAULT_BASE_URL
 
     # ── Step 3: Collect positions via Socket.IO (drone + dock in parallel) ──────
-    drone_task = flytbase.collect_drone_positions(
+    drone_task = flytbase.collect_drone_telemetry(
         access_token=access_token,
         org_id=org_id,
         drone_ids=action_config.drone_ids,
-        server_region=server_region,
+        base_url=base_url,
         window_seconds=action_config.window_duration_seconds,
+        collect_battery=action_config.collect_drone_battery,
+        collect_drone_state=action_config.collect_drone_state,
+        collect_notifications=action_config.collect_drone_notifications,
     )
     if action_config.dock_ids:
         dock_task = flytbase.collect_dock_telemetry(
             access_token=access_token,
             org_id=org_id,
             dock_ids=action_config.dock_ids,
-            server_region=server_region,
+            base_url=base_url,
             window_seconds=action_config.window_duration_seconds,
             collect_dock_state=action_config.collect_dock_state,
             collect_dock_weather=action_config.collect_dock_weather,
@@ -106,9 +107,30 @@ async def action_pull_observations(integration, action_config: FlytBasePullObser
     drone_name_map = action_config.drone_name_map or {}
     observations = []
 
-    for drone_id, messages in collected.items():
+    for drone_id, drone_data in collected.items():
         drone_name = drone_name_map.get(drone_id)
-        for position_data, recorded_at in messages:
+
+        # Window-average location for this drone's non-positional telemetry, with a
+        # dock-location fallback when the drone reported no GPS during the window.
+        #
+        # CAVEAT: battery/state/notification observations require a location (their
+        # transforms return None without one). If a drone reports no GPS — the exact
+        # case for a drone parked in its dock — AND no dock resolves, every such
+        # observation is silently dropped. resolve_dock_for_drone only resolves a
+        # dock for a single-dock deployment or an explicit drone_dock_map entry, so
+        # a multi-dock deployment that omits drone_dock_map loses all idle-drone
+        # battery/state/notification telemetry. See the drone_dock_map config field.
+        loc = flytbase.average_location(drone_data["positions"])
+        if loc is None:
+            dock_id = flytbase.resolve_dock_for_drone(
+                drone_id, action_config.dock_ids, action_config.drone_dock_map
+            )
+            dock_entry = dock_collected.get(dock_id) if dock_id else None
+            loc = dock_entry["dock_location"] if dock_entry else None
+        avg_lat, avg_lon = loc if loc else (None, None)
+
+        # Positions — full per-reading fidelity, each with its own coordinates.
+        for position_data, recorded_at in drone_data["positions"]:
             obs = flytbase.transform_position_to_observation(
                 drone_id=drone_id,
                 position_data=position_data,
@@ -118,6 +140,51 @@ async def action_pull_observations(integration, action_config: FlytBasePullObser
             )
             if obs is not None:
                 observations.append(obs)
+
+        # Battery — reduced to one per charging-state segment (averaged %).
+        if action_config.collect_drone_battery:
+            for battery_data, recorded_at in flytbase.reduce_battery(drone_data["battery"]):
+                obs = flytbase.transform_battery_to_observation(
+                    drone_id=drone_id,
+                    battery_data=battery_data,
+                    recorded_at=recorded_at,
+                    lat=avg_lat,
+                    lon=avg_lon,
+                    subject_type=action_config.subject_type,
+                    drone_name=drone_name,
+                )
+                if obs is not None:
+                    observations.append(obs)
+
+        # Drone state — reduced to one per state transition.
+        if action_config.collect_drone_state:
+            for state_data, recorded_at in flytbase.reduce_drone_state(drone_data["drone_state"]):
+                obs = flytbase.transform_drone_state_to_observation(
+                    drone_id=drone_id,
+                    state_data=state_data,
+                    recorded_at=recorded_at,
+                    lat=avg_lat,
+                    lon=avg_lon,
+                    subject_type=action_config.subject_type,
+                    drone_name=drone_name,
+                )
+                if obs is not None:
+                    observations.append(obs)
+
+        # Notifications — one observation per event.
+        if action_config.collect_drone_notifications:
+            for notif_data, recorded_at in drone_data["notification"]:
+                obs = flytbase.transform_notification_to_observation(
+                    drone_id=drone_id,
+                    notification_data=notif_data,
+                    recorded_at=recorded_at,
+                    lat=avg_lat,
+                    lon=avg_lon,
+                    subject_type=action_config.subject_type,
+                    drone_name=drone_name,
+                )
+                if obs is not None:
+                    observations.append(obs)
 
     dock_name_map = action_config.dock_name_map or {}
     for dock_id, dock_data in dock_collected.items():
@@ -171,14 +238,31 @@ async def action_pull_observations(integration, action_config: FlytBasePullObser
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
+def _token_state_from_response(token_response: dict) -> dict:
+    """
+    Builds the Redis state dict from a FlytBase token response, computing absolute
+    expiry timestamps. FlytBase returns `expires_in` (seconds), not an absolute
+    time, so expiry is derived via flytbase.get_token_expiry.
+    """
+    access = token_response["access"]
+    refresh = token_response.get("refresh") or {}
+    return {
+        "access_token": access["token"],
+        "access_token_expiry": flytbase.get_token_expiry(access),
+        "refresh_token": refresh.get("token"),
+        "refresh_token_expiry": flytbase.get_token_expiry(refresh),
+    }
+
+
 async def _get_valid_access_token(integration) -> str:
     """
-    Returns a valid FlytBase access token, refreshing or re-authenticating as needed.
+    Returns a valid FlytBase access token, re-authenticating if the cached token
+    is missing or expired.
 
-    Decision tree:
-      - Cached access token valid → return it
-      - Cached refresh token valid → refresh → store → return new access token
-      - Both expired/missing → full re-auth using auth config credentials → store → return
+    FlytBase exposes only the client-credentials token endpoint (GET /oauth/token),
+    which returns a fresh access token on each call. There is no usable refresh
+    grant (POST to the token endpoint returns 404), so "refresh" is simply a
+    re-authentication using the stored client credentials.
     """
     integration_id = str(integration.id)
     token_state = await state_manager.get_state(
@@ -188,36 +272,24 @@ async def _get_valid_access_token(integration) -> str:
 
     access_token = token_state.get("access_token")
     access_expiry = token_state.get("access_token_expiry")
-    refresh_token = token_state.get("refresh_token")
-    refresh_expiry = token_state.get("refresh_token_expiry")
 
     if access_token and not flytbase.is_token_expired(access_expiry):
         return access_token
 
-    if refresh_token and not flytbase.is_token_expired(refresh_expiry, buffer_seconds=0):
-        logger.info("Access token expiring; refreshing using refresh token.")
-        token_response = await flytbase.refresh_flytbase_token(refresh_token)
-    else:
-        logger.warning(
-            "Both access and refresh tokens missing or expired. Re-authenticating."
+    logger.info("FlytBase access token missing or expired; re-authenticating.")
+    auth_data = _get_auth_config_data(integration)
+    if not auth_data:
+        raise ValueError(
+            "Cannot re-authenticate: auth action configuration missing. "
+            "Please configure and run the 'auth' action manually."
         )
-        auth_data = _get_auth_config_data(integration)
-        if not auth_data:
-            raise ValueError(
-                "Cannot re-authenticate: auth action configuration missing. "
-                "Please configure and run the 'auth' action manually."
-            )
-        token_response = await flytbase.get_flytbase_token(
-            client_id=auth_data["client_id"],
-            client_secret=auth_data["client_secret"],
-        )
+    token_response = await flytbase.get_flytbase_token(
+        client_id=auth_data["client_id"],
+        client_secret=auth_data["client_secret"],
+        base_url=auth_data.get("base_url") or flytbase.FLYTBASE_DEFAULT_BASE_URL,
+    )
 
-    new_state = {
-        "access_token": token_response["access"]["token"],
-        "access_token_expiry": token_response["access"].get("expiry"),
-        "refresh_token": token_response["refresh"]["token"],
-        "refresh_token_expiry": token_response["refresh"].get("expiry"),
-    }
+    new_state = _token_state_from_response(token_response)
     await state_manager.set_state(
         integration_id=integration_id,
         action_id="auth",

@@ -8,7 +8,7 @@ This repo includes an integration with [FlytBase](https://flytbase.com/) for col
 
 **Actions:**
 
-- **`action_auth`** — Authenticates with FlytBase using OAuth2 client credentials. Requires `client_id`, `client_secret`, `org_id`, and `server_region` (US or EU). Tokens are cached in Redis for reuse by the pull action.
+- **`action_auth`** — Authenticates with FlytBase using OAuth2 client credentials. Requires `client_id`, `client_secret`, `org_id`, and `base_url` (the FlytBase API URL for your region, e.g. `https://api.flytbase.com`; the token and Socket.IO endpoints are derived from it). Tokens are cached in Redis for reuse by the pull action.
 
 - **`action_pull_observations`** — Pulls real-time telemetry from FlytBase drones and docks. Runs every 5 minutes via cron schedule (`*/5 * * * *`). Connects to FlytBase Socket.IO endpoints and subscribes to telemetry channels for a configurable collection window (default 270 seconds).
 

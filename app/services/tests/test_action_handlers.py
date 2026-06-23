@@ -6,10 +6,12 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic import ValidationError
 from gundi_core.schemas.v2 import Integration
 
 from app.actions.configurations import FlytBaseAuthConfig, FlytBasePullObservationsConfig
 from app.actions.handlers import action_auth, action_pull_observations
+from app.services import flytbase
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -18,13 +20,18 @@ INTEGRATION_ID = "779ff3ab-5589-4f4c-9e0a-ae8d6c9edff0"
 DRONE_ID = "648f2a3d7b1c9e5f4a8d0c2e"
 
 
+def _drone_only(positions):
+    """Wrap a positions list in the collect_drone_telemetry return shape."""
+    return {DRONE_ID: {"positions": positions, "battery": [], "drone_state": [], "notification": []}}
+
+
 @pytest.fixture
 def mock_token_response_fresh():
-    future = (datetime.now(timezone.utc) + timedelta(minutes=14)).isoformat()
-    refresh_future = (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()
+    # FlytBase returns lifetimes as `expires_in` (seconds), not an absolute time —
+    # see flytbase.get_token_expiry. 14 min access / 6 day refresh.
     return {
-        "access": {"token": "fresh-access-token", "expiry": future},
-        "refresh": {"token": "fresh-refresh-token", "expiry": refresh_future},
+        "access": {"token": "fresh-access-token", "expires_in": 14 * 60},
+        "refresh": {"token": "fresh-refresh-token", "expires_in": 6 * 24 * 60 * 60},
     }
 
 
@@ -80,7 +87,7 @@ def flytbase_integration(integration_v2_as_dict):
                 "client_id": "test-client-id",
                 "client_secret": "test-client-secret",
                 "org_id": "test-org-id",
-                "server_region": "US",
+                "base_url": "https://api.flytbase.com",
             }
     return Integration.parse_obj(data)
 
@@ -91,8 +98,35 @@ def auth_config():
         client_id="test-client-id",
         client_secret="test-client-secret",
         org_id="test-org-id",
-        server_region="US",
+        base_url="https://api.flytbase.com",
     )
+
+
+# ── FlytBaseAuthConfig.base_url validation ────────────────────────────────────
+
+def _auth_config(base_url):
+    return FlytBaseAuthConfig(
+        client_id="id", client_secret="secret", org_id="org", base_url=base_url
+    )
+
+
+def test_base_url_defaults_to_us_host():
+    config = FlytBaseAuthConfig(client_id="id", client_secret="secret", org_id="org")
+    assert config.base_url == "https://api.flytbase.com"
+
+
+def test_base_url_strips_trailing_slash():
+    assert _auth_config("https://api.flytbase.com/").base_url == "https://api.flytbase.com"
+
+
+def test_base_url_accepts_alternate_region_host():
+    assert _auth_config("https://api-eu.flytbase.com").base_url == "https://api-eu.flytbase.com"
+
+
+@pytest.mark.parametrize("bad_url", ["not-a-url", "ftp://api.flytbase.com", "api.flytbase.com", ""])
+def test_base_url_rejects_invalid_urls(bad_url):
+    with pytest.raises(ValidationError):
+        _auth_config(bad_url)
 
 
 @pytest.fixture
@@ -145,7 +179,7 @@ async def test_action_auth_stores_tokens(
     """action_auth should call get_flytbase_token and store tokens in state manager."""
     mock_get_token = AsyncMock(return_value=mock_token_response_fresh)
     mocker.patch("app.services.flytbase.get_flytbase_token", mock_get_token)
-    mocker.patch("app.actions.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
 
     mock_sm = MagicMock()
     mock_sm.set_state = AsyncMock(return_value=None)
@@ -157,12 +191,19 @@ async def test_action_auth_stores_tokens(
     mock_get_token.assert_called_once_with(
         client_id="test-client-id",
         client_secret="test-client-secret",
+        base_url="https://api.flytbase.com",
     )
     mock_sm.set_state.assert_called_once()
     call_kwargs = mock_sm.set_state.call_args.kwargs
     assert call_kwargs["action_id"] == "auth"
     assert call_kwargs["state"]["access_token"] == "fresh-access-token"
     assert call_kwargs["state"]["refresh_token"] == "fresh-refresh-token"
+    # Expiry must be derived from `expires_in` and stored as a future timestamp —
+    # a None here means the auth → store → cache path silently broke (the token
+    # would be treated as already-expired on every subsequent pull).
+    stored_expiry = call_kwargs["state"]["access_token_expiry"]
+    assert stored_expiry is not None
+    assert not flytbase.is_token_expired(stored_expiry)
 
 
 @pytest.mark.asyncio
@@ -177,7 +218,7 @@ async def test_action_auth_propagates_http_error(
         AsyncMock(side_effect=httpx.HTTPStatusError("401", request=MagicMock(), response=MagicMock(status_code=401))),
     )
     mocker.patch("app.actions.handlers.state_manager", MagicMock(set_state=AsyncMock()))
-    mocker.patch("app.actions.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
 
     with pytest.raises(httpx.HTTPStatusError):
         await action_auth(integration=flytbase_integration, action_config=auth_config)
@@ -195,55 +236,53 @@ async def test_pull_uses_cached_valid_token(
     mock_sm.set_state = AsyncMock(return_value=None)
     mocker.patch("app.actions.handlers.state_manager", mock_sm)
 
-    mock_collect = AsyncMock(return_value={DRONE_ID: sample_positions})
-    mocker.patch("app.services.flytbase.collect_drone_positions", mock_collect)
-    mocker.patch("app.services.gundi.send_observations_to_gundi", AsyncMock(return_value=[{}, {}]))
+    mock_collect = AsyncMock(return_value=_drone_only(sample_positions))
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[{}, {}]))
     mocker.patch("app.services.gundi._get_gundi_api_key", AsyncMock(return_value="fake-key"))
-    mocker.patch("app.actions.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
 
     mock_get_token = AsyncMock()
-    mock_refresh_token = AsyncMock()
     mocker.patch("app.services.flytbase.get_flytbase_token", mock_get_token)
-    mocker.patch("app.services.flytbase.refresh_flytbase_token", mock_refresh_token)
 
     result = await action_pull_observations(
         integration=flytbase_integration, action_config=pull_config
     )
 
     mock_get_token.assert_not_called()
-    mock_refresh_token.assert_not_called()
     mock_collect.assert_called_once()
     assert mock_collect.call_args.kwargs["access_token"] == "cached-access-token"
     assert result["observations_extracted"] == 2
 
 
 @pytest.mark.asyncio
-async def test_pull_refreshes_expired_access_token(
+async def test_pull_reauths_when_access_token_expired(
     mocker, flytbase_integration, pull_config, mock_publish_event,
     expired_access_token_state, mock_token_response_fresh, sample_positions
 ):
-    """When access token is expired but refresh token is valid, use refresh."""
+    """When the access token is expired, re-authenticate via the client-credentials
+    GET. FlytBase has no usable refresh grant, so 'refresh' == full re-auth."""
     mock_sm = MagicMock()
     mock_sm.get_state = AsyncMock(return_value=expired_access_token_state)
     mock_sm.set_state = AsyncMock(return_value=None)
     mocker.patch("app.actions.handlers.state_manager", mock_sm)
 
-    mock_refresh = AsyncMock(return_value=mock_token_response_fresh)
-    mocker.patch("app.services.flytbase.refresh_flytbase_token", mock_refresh)
-
-    mock_get_token = AsyncMock()
+    mock_get_token = AsyncMock(return_value=mock_token_response_fresh)
     mocker.patch("app.services.flytbase.get_flytbase_token", mock_get_token)
 
-    mock_collect = AsyncMock(return_value={DRONE_ID: sample_positions})
-    mocker.patch("app.services.flytbase.collect_drone_positions", mock_collect)
-    mocker.patch("app.services.gundi.send_observations_to_gundi", AsyncMock(return_value=[{}, {}]))
+    mock_collect = AsyncMock(return_value=_drone_only(sample_positions))
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[{}, {}]))
     mocker.patch("app.services.gundi._get_gundi_api_key", AsyncMock(return_value="fake-key"))
-    mocker.patch("app.actions.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
 
     await action_pull_observations(integration=flytbase_integration, action_config=pull_config)
 
-    mock_refresh.assert_called_once_with("valid-refresh-token")
-    mock_get_token.assert_not_called()
+    mock_get_token.assert_called_once_with(
+        client_id="test-client-id",
+        client_secret="test-client-secret",
+        base_url="https://api.flytbase.com",
+    )
     # New token stored
     mock_sm.set_state.assert_called()
     stored = mock_sm.set_state.call_args.kwargs["state"]
@@ -264,22 +303,19 @@ async def test_pull_full_reauth_when_both_tokens_expired(
     mock_get_token = AsyncMock(return_value=mock_token_response_fresh)
     mocker.patch("app.services.flytbase.get_flytbase_token", mock_get_token)
 
-    mock_refresh = AsyncMock()
-    mocker.patch("app.services.flytbase.refresh_flytbase_token", mock_refresh)
-
-    mock_collect = AsyncMock(return_value={DRONE_ID: sample_positions})
-    mocker.patch("app.services.flytbase.collect_drone_positions", mock_collect)
-    mocker.patch("app.services.gundi.send_observations_to_gundi", AsyncMock(return_value=[{}, {}]))
+    mock_collect = AsyncMock(return_value=_drone_only(sample_positions))
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[{}, {}]))
     mocker.patch("app.services.gundi._get_gundi_api_key", AsyncMock(return_value="fake-key"))
-    mocker.patch("app.actions.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
 
     await action_pull_observations(integration=flytbase_integration, action_config=pull_config)
 
     mock_get_token.assert_called_once_with(
         client_id="test-client-id",
         client_secret="test-client-secret",
+        base_url="https://api.flytbase.com",
     )
-    mock_refresh.assert_not_called()
 
 
 # ── action_pull_observations — data flow ─────────────────────────────────────
@@ -295,13 +331,13 @@ async def test_pull_sends_observations_to_gundi(
     mock_sm.set_state = AsyncMock(return_value=None)
     mocker.patch("app.actions.handlers.state_manager", mock_sm)
 
-    mock_collect = AsyncMock(return_value={DRONE_ID: sample_positions})
-    mocker.patch("app.services.flytbase.collect_drone_positions", mock_collect)
+    mock_collect = AsyncMock(return_value=_drone_only(sample_positions))
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
 
     mock_send = AsyncMock(return_value=[{}, {}])
-    mocker.patch("app.services.gundi.send_observations_to_gundi", mock_send)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", mock_send)
     mocker.patch("app.services.gundi._get_gundi_api_key", AsyncMock(return_value="fake-key"))
-    mocker.patch("app.actions.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
 
     result = await action_pull_observations(
         integration=flytbase_integration, action_config=pull_config
@@ -328,13 +364,13 @@ async def test_pull_applies_drone_name_map(
     mock_sm.set_state = AsyncMock(return_value=None)
     mocker.patch("app.actions.handlers.state_manager", mock_sm)
 
-    mock_collect = AsyncMock(return_value={DRONE_ID: sample_positions})
-    mocker.patch("app.services.flytbase.collect_drone_positions", mock_collect)
+    mock_collect = AsyncMock(return_value=_drone_only(sample_positions))
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
 
     mock_send = AsyncMock(return_value=[{}, {}])
-    mocker.patch("app.services.gundi.send_observations_to_gundi", mock_send)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", mock_send)
     mocker.patch("app.services.gundi._get_gundi_api_key", AsyncMock(return_value="fake-key"))
-    mocker.patch("app.actions.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
 
     await action_pull_observations(
         integration=flytbase_integration, action_config=pull_config_with_names
@@ -361,13 +397,13 @@ async def test_pull_filters_missing_coords(
         "rtk": {},
     }
     ts = datetime.now(timezone.utc).isoformat()
-    mock_collect = AsyncMock(return_value={DRONE_ID: [(no_coords_pos, ts), (no_coords_pos, ts)]})
-    mocker.patch("app.services.flytbase.collect_drone_positions", mock_collect)
+    mock_collect = AsyncMock(return_value=_drone_only([(no_coords_pos, ts), (no_coords_pos, ts)]))
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
 
     mock_send = AsyncMock()
-    mocker.patch("app.services.gundi.send_observations_to_gundi", mock_send)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", mock_send)
     mocker.patch("app.services.gundi._get_gundi_api_key", AsyncMock(return_value="fake-key"))
-    mocker.patch("app.actions.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
 
     result = await action_pull_observations(
         integration=flytbase_integration, action_config=pull_config
@@ -387,13 +423,13 @@ async def test_pull_empty_window_no_crash(
     mock_sm.set_state = AsyncMock(return_value=None)
     mocker.patch("app.actions.handlers.state_manager", mock_sm)
 
-    mock_collect = AsyncMock(return_value={DRONE_ID: []})
-    mocker.patch("app.services.flytbase.collect_drone_positions", mock_collect)
+    mock_collect = AsyncMock(return_value=_drone_only([]))
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
 
     mock_send = AsyncMock()
-    mocker.patch("app.services.gundi.send_observations_to_gundi", mock_send)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", mock_send)
     mocker.patch("app.services.gundi._get_gundi_api_key", AsyncMock(return_value="fake-key"))
-    mocker.patch("app.actions.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
 
     result = await action_pull_observations(
         integration=flytbase_integration, action_config=pull_config
@@ -419,6 +455,9 @@ def pull_config_with_docks():
         dock_subject_type="dock",
         collect_dock_state=True,
         collect_dock_weather=True,
+        collect_drone_battery=True,
+        collect_drone_state=True,
+        collect_drone_notifications=True,
     )
 
 
@@ -452,15 +491,15 @@ def _setup_pull_mocks(mocker, mock_publish_event, valid_token_state,
     mocker.patch("app.actions.handlers.state_manager", mock_sm)
 
     mock_drone_collect = AsyncMock(return_value=drone_collect_return)
-    mocker.patch("app.services.flytbase.collect_drone_positions", mock_drone_collect)
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_drone_collect)
 
     mock_dock_collect = AsyncMock(return_value=dock_collect_return or {})
     mocker.patch("app.services.flytbase.collect_dock_telemetry", mock_dock_collect)
 
     mock_send = AsyncMock(return_value=[])
-    mocker.patch("app.services.gundi.send_observations_to_gundi", mock_send)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", mock_send)
     mocker.patch("app.services.gundi._get_gundi_api_key", AsyncMock(return_value="fake-key"))
-    mocker.patch("app.actions.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
 
     return mock_drone_collect, mock_dock_collect, mock_send
 
@@ -473,7 +512,7 @@ async def test_pull_skips_dock_collection_when_no_dock_ids(
     """collect_dock_telemetry should NOT be called when dock_ids is not set."""
     mock_drone_collect, mock_dock_collect, _ = _setup_pull_mocks(
         mocker, mock_publish_event, valid_token_state,
-        drone_collect_return={DRONE_ID: sample_positions},
+        drone_collect_return=_drone_only(sample_positions),
     )
 
     await action_pull_observations(integration=flytbase_integration, action_config=pull_config)
@@ -490,7 +529,7 @@ async def test_pull_collects_dock_telemetry_when_dock_ids_configured(
     """collect_dock_telemetry should be called when dock_ids is configured."""
     mock_drone_collect, mock_dock_collect, _ = _setup_pull_mocks(
         mocker, mock_publish_event, valid_token_state,
-        drone_collect_return={DRONE_ID: sample_positions},
+        drone_collect_return=_drone_only(sample_positions),
         dock_collect_return=sample_dock_telemetry,
     )
 
@@ -513,7 +552,7 @@ async def test_pull_sends_dock_state_observations(
     """Dock state messages should be transformed and included in the Gundi send."""
     _, _, mock_send = _setup_pull_mocks(
         mocker, mock_publish_event, valid_token_state,
-        drone_collect_return={DRONE_ID: []},
+        drone_collect_return=_drone_only([]),
         dock_collect_return=sample_dock_telemetry,
     )
 
@@ -542,7 +581,7 @@ async def test_pull_sends_dock_weather_observations(
     """Dock weather messages should be transformed and included in the Gundi send."""
     _, _, mock_send = _setup_pull_mocks(
         mocker, mock_publish_event, valid_token_state,
-        drone_collect_return={DRONE_ID: []},
+        drone_collect_return=_drone_only([]),
         dock_collect_return=sample_dock_telemetry,
     )
 
@@ -578,7 +617,7 @@ async def test_pull_skips_dock_obs_without_location(
 
     _, _, mock_send = _setup_pull_mocks(
         mocker, mock_publish_event, valid_token_state,
-        drone_collect_return={DRONE_ID: []},
+        drone_collect_return=_drone_only([]),
         dock_collect_return=no_location_dock,
     )
 
@@ -588,3 +627,50 @@ async def test_pull_skips_dock_obs_without_location(
 
     assert result["observations_extracted"] == 0
     mock_send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pull_sends_reduced_battery_state_notification_with_dock_fallback(
+    mocker, flytbase_integration, pull_config_with_docks, mock_publish_event,
+    valid_token_state, sample_dock_telemetry
+):
+    """Battery/state/notification are reduced and geotagged; with no drone GPS the
+    single configured dock's location is used as the fallback."""
+    ts = datetime.now(timezone.utc).isoformat()
+    drone_return = {
+        DRONE_ID: {
+            "positions": [],  # no GPS -> dock fallback
+            "battery": [
+                ({"total_percentage": 80, "charging_state": 1}, ts),
+                ({"total_percentage": 82, "charging_state": 1}, ts),
+            ],
+            "drone_state": [
+                ({"connected": True, "armed": False, "mode": {"state": 0}, "drone_state": 0}, ts),
+                ({"connected": True, "armed": True, "mode": {"state": 1}, "drone_state": 1}, ts),
+            ],
+            "notification": [({"level": "warning", "category": "battery"}, ts)],
+        }
+    }
+    _, _, mock_send = _setup_pull_mocks(
+        mocker, mock_publish_event, valid_token_state,
+        drone_collect_return=drone_return,
+        dock_collect_return=sample_dock_telemetry,
+    )
+
+    await action_pull_observations(
+        integration=flytbase_integration, action_config=pull_config_with_docks
+    )
+
+    sent = mock_send.call_args.kwargs["observations"]
+    by_type = {}
+    for o in sent:
+        t = o.get("additional", {}).get("telemetry_type")
+        by_type.setdefault(t, []).append(o)
+    # 1 battery (single charging-state segment), 2 drone_state (two distinct states), 1 notification
+    assert len(by_type["battery"]) == 1
+    assert by_type["battery"][0]["additional"]["battery_percentage"] == 81.0
+    assert len(by_type["drone_state"]) == 2
+    assert len(by_type["notification"]) == 1
+    # All geotagged with the dock's fallback location
+    for o in by_type["battery"] + by_type["drone_state"] + by_type["notification"]:
+        assert o["location"] == {"lat": 18.5628, "lon": 73.7010}
