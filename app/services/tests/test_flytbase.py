@@ -68,11 +68,11 @@ def sample_position_missing_coords():
 
 @pytest.fixture
 def mock_token_response():
-    future = (datetime.now(timezone.utc) + timedelta(minutes=14)).isoformat()
-    refresh_future = (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()
+    # FlytBase returns lifetimes as `expires_in` (seconds), not an absolute time —
+    # see flytbase.get_token_expiry. 14 min access / 6 day refresh.
     return {
-        "access": {"token": "test-access-token", "expiry": future},
-        "refresh": {"token": "test-refresh-token", "expiry": refresh_future},
+        "access": {"token": "test-access-token", "expires_in": 14 * 60},
+        "refresh": {"token": "test-refresh-token", "expires_in": 6 * 24 * 60 * 60},
     }
 
 

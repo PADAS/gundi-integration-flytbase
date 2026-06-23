@@ -46,14 +46,16 @@ async def action_auth(integration, action_config: FlytBaseAuthConfig):
 @crontab_schedule("*/5 * * * *")  # Every 5 minutes
 async def action_pull_observations(integration, action_config: FlytBasePullObservationsConfig):
     """
-    Connects to FlytBase Socket.IO, subscribes to each configured drone's
-    global_position channel, collects position messages for window_duration_seconds,
+    Connects to FlytBase Socket.IO and, for each configured drone, subscribes to
+    global_position plus (per the collect_* flags) battery, drone_state, and
+    notification channels; for each configured dock, subscribes to global_position
+    plus dock_state and weather. Collects messages for window_duration_seconds,
     transforms them into Gundi Observations, and sends them in batches.
 
-    Token refresh decision:
-      1. Use cached access token if not expiring within 2 min.
-      2. Refresh using refresh token if available and not expired.
-      3. Fall back to full re-authentication using auth action credentials.
+    Access token handling (see _get_valid_access_token):
+      1. Use the cached access token if it is not expiring within 2 min.
+      2. Otherwise re-authenticate with the stored client credentials. FlytBase
+         has no usable refresh grant, so "refresh" is a full re-auth.
     """
     integration_id = str(integration.id)
     logger.info(

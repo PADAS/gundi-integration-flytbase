@@ -10,6 +10,7 @@ from gundi_core.schemas.v2 import Integration
 
 from app.actions.configurations import FlytBaseAuthConfig, FlytBasePullObservationsConfig
 from app.actions.handlers import action_auth, action_pull_observations
+from app.services import flytbase
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -25,11 +26,11 @@ def _drone_only(positions):
 
 @pytest.fixture
 def mock_token_response_fresh():
-    future = (datetime.now(timezone.utc) + timedelta(minutes=14)).isoformat()
-    refresh_future = (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()
+    # FlytBase returns lifetimes as `expires_in` (seconds), not an absolute time —
+    # see flytbase.get_token_expiry. 14 min access / 6 day refresh.
     return {
-        "access": {"token": "fresh-access-token", "expiry": future},
-        "refresh": {"token": "fresh-refresh-token", "expiry": refresh_future},
+        "access": {"token": "fresh-access-token", "expires_in": 14 * 60},
+        "refresh": {"token": "fresh-refresh-token", "expires_in": 6 * 24 * 60 * 60},
     }
 
 
@@ -168,6 +169,12 @@ async def test_action_auth_stores_tokens(
     assert call_kwargs["action_id"] == "auth"
     assert call_kwargs["state"]["access_token"] == "fresh-access-token"
     assert call_kwargs["state"]["refresh_token"] == "fresh-refresh-token"
+    # Expiry must be derived from `expires_in` and stored as a future timestamp —
+    # a None here means the auth → store → cache path silently broke (the token
+    # would be treated as already-expired on every subsequent pull).
+    stored_expiry = call_kwargs["state"]["access_token_expiry"]
+    assert stored_expiry is not None
+    assert not flytbase.is_token_expired(stored_expiry)
 
 
 @pytest.mark.asyncio
