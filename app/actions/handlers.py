@@ -2,6 +2,8 @@ import asyncio
 import logging
 from typing import Optional
 
+import httpx
+
 from app.actions.configurations import FlytBaseAuthConfig, FlytBasePullObservationsConfig
 from app.services import flytbase
 from app.services.action_scheduler import crontab_schedule
@@ -23,15 +25,28 @@ async def action_auth(integration, action_config: FlytBaseAuthConfig):
     Validates FlytBase credentials by performing an OAuth2 token exchange.
     Stores access and refresh tokens in the state manager (Redis) for use by
     the pull_observations action. Run this manually from the Gundi portal first.
+
+    Returns {"valid_credentials": False} when FlytBase rejects the credentials
+    (HTTP 401/403). Any other error (network failure, 5xx, Redis write failure)
+    is operational rather than a credential problem and propagates so it is
+    recorded as a failed action run.
     """
     integration_id = str(integration.id)
     logger.info(f"Authenticating FlytBase for integration {integration_id}")
 
-    token_response = await flytbase.get_flytbase_token(
-        client_id=action_config.client_id,
-        client_secret=action_config.client_secret.get_secret_value(),
-        base_url=action_config.base_url,
-    )
+    try:
+        token_response = await flytbase.get_flytbase_token(
+            client_id=action_config.client_id,
+            client_secret=action_config.client_secret.get_secret_value(),
+            base_url=action_config.base_url,
+        )
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (401, 403):
+            logger.warning(
+                f"FlytBase credentials rejected for integration {integration_id}: {e}"
+            )
+            return {"valid_credentials": False, "error": "Invalid FlytBase credentials."}
+        raise
 
     await state_manager.set_state(
         integration_id=integration_id,
@@ -40,7 +55,7 @@ async def action_auth(integration, action_config: FlytBaseAuthConfig):
     )
 
     logger.info(f"FlytBase tokens stored for integration {integration_id}")
-    return {"status": "authenticated"}
+    return {"valid_credentials": True}
 
 
 @activity_logger()
