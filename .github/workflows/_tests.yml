@@ -14,7 +14,9 @@ jobs:
       - name: Install pip
         run: python -m ensurepip --upgrade
       - name: Install pip tools
-        run: pip install pip-tools
+        # pip-tools 7.6.0 crashes on Python 3.10 (imports typing_extensions
+        # without declaring it as a dependency); pin to the last good release.
+        run: pip install "pip-tools==7.5.3"
       - name: Install compile dependencies
         run: pip-compile --output-file=requirements.txt requirements-base.in requirements-dev.in requirements.in
       - name: Install dependencies
