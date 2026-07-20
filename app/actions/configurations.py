@@ -177,5 +177,8 @@ class FlytBasePullObservationsConfig(PullActionConfiguration):
             "dock_ids", "dock_name_map", "dock_subject_type",
             "collect_dock_state", "collect_dock_weather",
             "drone_dock_map",
+            # Inherited from PullActionConfiguration (template); rjsf requires every
+            # property to appear in ui:order when one is provided.
+            "run_on_schedule",
         ],
     )
