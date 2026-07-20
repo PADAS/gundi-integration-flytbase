@@ -16,6 +16,21 @@ def _make_jwt(exp: int) -> str:
     return f"{seg({'alg': 'none'})}.{seg({'exp': exp})}.sig"
 
 
+def test_engineio_aiohttp_pairing():
+    """python-engineio's websocket transport calls aiohttp.ClientWSTimeout (added
+    in aiohttp 3.10) but treats aiohttp as an optional import with no version
+    constraint, so dependency resolution can silently pair it with an older
+    aiohttp — which then crashes every real Socket.IO connect (the rest of this
+    suite mocks socketio.AsyncClient and would never notice). Guard the pairing.
+    """
+    import aiohttp
+
+    assert hasattr(aiohttp, "ClientWSTimeout"), (
+        "aiohttp is too old for python-engineio's websocket transport; "
+        "aiohttp>=3.10 is required (see requirements.in)."
+    )
+
+
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 DRONE_ID = "648f2a3d7b1c9e5f4a8d0c2e"
