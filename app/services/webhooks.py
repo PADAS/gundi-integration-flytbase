@@ -68,7 +68,7 @@ async def _validate_diagnostic_url(url: str) -> None:
     if not hostname:
         raise ValueError("Diagnostic URL has no hostname.")
     allowlist = settings.DIAGNOSTIC_URL_ALLOWLIST
-    if allowlist and hostname not in [h.rstrip(".").lower() for h in allowlist]:
+    if allowlist and hostname not in [h.strip().rstrip(".").lower() for h in allowlist]:
         raise ValueError(
             f"Diagnostic URL hostname '{hostname}' is not in the configured allowlist."
         )
@@ -95,7 +95,7 @@ async def forward_payload_to_diagnostic_url(
         await _validate_diagnostic_url(destination_url)
         metadata = {
             "integration_id": integration_id,
-            "received_at": datetime.datetime.now(datetime.UTC).isoformat() + "Z",
+            "received_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         if isinstance(json_content, dict):
             body = {**json_content, "__gundi_diagnostic_metadata": metadata}
