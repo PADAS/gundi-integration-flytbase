@@ -95,8 +95,15 @@ class FlytBasePullObservationsConfig(PullActionConfiguration):
         description="Gundi subject type tag applied to all observations (e.g. 'drone', 'uav').",
         ui_options=UIOptions(widget="text"),
     )
+    # NOTE: the optional map/list fields below default to {} / [] rather than
+    # None. The portal seeds unset fields with null, and its schema validation
+    # (ajv) rejects null against "type: object"/"type: array" — blocking the
+    # form — because pydantic v1 does not emit nullable schemas for Optional
+    # fields. A concrete default is emitted into the schema and seeds the form
+    # with a valid value. Optional[...] typing is kept so configs stored with
+    # null still parse.
     drone_name_map: Optional[Dict[str, str]] = FieldWithUIOptions(
-        None,
+        {},
         title="Drone Name Map",
         description=(
             'Optional JSON map of drone_id to human-readable display name. '
@@ -105,7 +112,7 @@ class FlytBasePullObservationsConfig(PullActionConfiguration):
         ),
     )
     dock_ids: Optional[List[str]] = FieldWithUIOptions(
-        None,
+        [],
         title="Dock IDs",
         description=(
             "FlytBase dock device IDs to subscribe to (MongoDB ObjectId format). "
@@ -115,7 +122,7 @@ class FlytBasePullObservationsConfig(PullActionConfiguration):
         # ui_options=UIOptions(widget="text"),
     )
     dock_name_map: Optional[Dict[str, str]] = FieldWithUIOptions(
-        None,
+        {},
         title="Dock Name Map",
         description=(
             'Optional JSON map of dock_id to human-readable display name. '
@@ -160,7 +167,7 @@ class FlytBasePullObservationsConfig(PullActionConfiguration):
         ui_options=UIOptions(widget="checkbox"),
     )
     drone_dock_map: Optional[Dict[str, str]] = FieldWithUIOptions(
-        None,
+        {},
         title="Drone-to-Dock Map",
         description=(
             "Optional JSON map of drone_id to dock_id. Used to geotag battery/state/"
