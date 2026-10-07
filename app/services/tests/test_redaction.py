@@ -506,6 +506,28 @@ def test_redact_url_masks_a_url_it_cannot_parse_instead_of_raising():
     assert redact_url("https://[broken]?token=abc") == REDACTED
 
 
+def test_redact_url_masks_http_userinfo_whole_and_keeps_the_host():
+    # httpx keeps basic credentials in request.url, so a connector whose base
+    # URL carries them would publish them in request_url without this.
+    assert redact_url("https://user:s3cret@api.example.com/v1/items") == (
+        f"https://{REDACTED}@api.example.com/v1/items"
+    )
+    # Port and a secret query parameter are handled in the same pass.
+    assert redact_url("https://user:s3cret@api.example.com:8443/v1?api_key=k&page=2") == (
+        f"https://{REDACTED}@api.example.com:8443/v1?api_key={REDACTED}&page=2"
+    )
+    # A lone username is still a credential.
+    assert redact_url("https://token123@api.example.com/") == f"https://{REDACTED}@api.example.com/"
+
+
+def test_redact_text_masks_http_userinfo_in_a_url_quoted_in_free_text():
+    text = "Client error '401 Unauthorized' for url 'https://user:s3cret@api.example.com/v1/items'"
+    assert redact_text(text) == (
+        f"Client error '401 Unauthorized' for url 'https://{REDACTED}@api.example.com/v1/items'"
+    )
+    assert "s3cret" not in redact_text(f"base_url=https://user:s3cret@api.example.com/v1 failed")
+
+
 def test_redact_text_masks_a_malformed_url_whole_and_never_raises():
     # Redaction runs inside the runner's error handling: raising there
     # would lose the failure event and the structured response.
