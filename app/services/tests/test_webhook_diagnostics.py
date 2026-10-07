@@ -110,11 +110,13 @@ async def test_forward_posts_dict_payload_with_metadata(mocker):
     assert body["device"] == "abc"
     metadata = body["__gundi_diagnostic_metadata"]
     assert metadata["integration_id"] == "test-integration-id"
-    # received_at must be valid, tz-aware ISO 8601 (no trailing 'Z' after an
-    # explicit +00:00 offset, and no datetime.UTC — that crashes on Python 3.10).
+    # received_at must be a tz-aware UTC timestamp in RFC 3339 "Z" form (the
+    # template replaces the +00:00 offset with Z). Python 3.10's fromisoformat
+    # cannot parse "Z", so normalise before parsing.
     received_at = metadata["received_at"]
-    assert not received_at.endswith("Z")
-    assert datetime.fromisoformat(received_at).tzinfo is not None
+    assert received_at.endswith("Z")
+    assert "+00:00" not in received_at
+    assert datetime.fromisoformat(received_at.replace("Z", "+00:00")).tzinfo is not None
 
 
 @pytest.mark.asyncio
