@@ -702,3 +702,110 @@ async def test_pull_sends_reduced_battery_state_notification_with_dock_fallback(
     # All geotagged with the dock's fallback location
     for o in by_type["battery"] + by_type["drone_state"] + by_type["notification"]:
         assert o["location"] == {"lat": 18.5628, "lon": 73.7010}
+
+
+# ── action_pull_observations — transient FlytBase gateway failures ────────────
+# FlytBase's edge intermittently answers 504 to the Socket.IO handshake and to
+# the token endpoint. Both fail in well under a second and before any data is
+# collected, so the handler retries them instead of failing the whole run.
+
+@pytest.fixture
+def no_backoff():
+    """stamina's testing mode: no sleeps between attempts, attempts capped."""
+    import stamina
+    stamina.set_testing(True, attempts=3)
+    yield
+    stamina.set_testing(False)
+
+
+def _patch_pull_plumbing(mocker, mock_publish_event, token_state):
+    mock_sm = MagicMock()
+    mock_sm.get_state = AsyncMock(return_value=token_state)
+    mock_sm.set_state = AsyncMock(return_value=None)
+    mocker.patch("app.actions.handlers.state_manager", mock_sm)
+    mocker.patch("app.actions.handlers.send_observations_to_gundi", AsyncMock(return_value=[{}, {}]))
+    mocker.patch("app.services.gundi._get_gundi_api_key", AsyncMock(return_value="fake-key"))
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+
+
+@pytest.mark.asyncio
+async def test_pull_retries_socket_connection_error(
+    mocker, flytbase_integration, pull_config, mock_publish_event, valid_token_state,
+    sample_positions, no_backoff,
+):
+    """A failed Socket.IO handshake (e.g. a 504 from FlytBase's gateway) is retried."""
+    import socketio
+
+    _patch_pull_plumbing(mocker, mock_publish_event, valid_token_state)
+    mock_collect = AsyncMock(side_effect=[
+        socketio.exceptions.ConnectionError("Connection error"),
+        _drone_only(sample_positions),
+    ])
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
+
+    result = await action_pull_observations(integration=flytbase_integration, action_config=pull_config)
+
+    assert mock_collect.call_count == 2
+    assert result["observations_extracted"] == 2
+
+
+@pytest.mark.asyncio
+async def test_pull_raises_when_socket_connection_keeps_failing(
+    mocker, flytbase_integration, pull_config, mock_publish_event, valid_token_state, no_backoff,
+):
+    """A persistent connection failure still fails the run once retries run out."""
+    import socketio
+
+    _patch_pull_plumbing(mocker, mock_publish_event, valid_token_state)
+    mock_collect = AsyncMock(side_effect=socketio.exceptions.ConnectionError("Connection error"))
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
+
+    with pytest.raises(socketio.exceptions.ConnectionError):
+        await action_pull_observations(integration=flytbase_integration, action_config=pull_config)
+
+    assert mock_collect.call_count == 3
+
+
+def _token_status_error(status_code):
+    import httpx
+    request = httpx.Request("GET", "https://api.flytbase.com/oauth/token")
+    return httpx.HTTPStatusError(
+        f"HTTP {status_code}", request=request, response=httpx.Response(status_code, request=request)
+    )
+
+
+@pytest.mark.asyncio
+async def test_pull_retries_token_fetch_on_gateway_error(
+    mocker, flytbase_integration, pull_config, mock_publish_event,
+    expired_access_token_state, mock_token_response_fresh, sample_positions, no_backoff,
+):
+    """A 5xx from the token endpoint during re-auth is retried."""
+    _patch_pull_plumbing(mocker, mock_publish_event, expired_access_token_state)
+    mock_get_token = AsyncMock(side_effect=[_token_status_error(504), mock_token_response_fresh])
+    mocker.patch("app.services.flytbase.get_flytbase_token", mock_get_token)
+    mock_collect = AsyncMock(return_value=_drone_only(sample_positions))
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", mock_collect)
+
+    await action_pull_observations(integration=flytbase_integration, action_config=pull_config)
+
+    assert mock_get_token.call_count == 2
+    assert mock_collect.call_args.kwargs["access_token"] == "fresh-access-token"
+
+
+@pytest.mark.asyncio
+async def test_pull_does_not_retry_rejected_credentials(
+    mocker, flytbase_integration, pull_config, mock_publish_event,
+    expired_access_token_state, no_backoff,
+):
+    """A 401 from the token endpoint is a definite answer: fail at once."""
+    import httpx
+
+    _patch_pull_plumbing(mocker, mock_publish_event, expired_access_token_state)
+    mock_get_token = AsyncMock(side_effect=_token_status_error(401))
+    mocker.patch("app.services.flytbase.get_flytbase_token", mock_get_token)
+    mocker.patch("app.services.flytbase.collect_drone_telemetry", AsyncMock())
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await action_pull_observations(integration=flytbase_integration, action_config=pull_config)
+
+    assert mock_get_token.call_count == 1
