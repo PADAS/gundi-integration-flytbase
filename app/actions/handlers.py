@@ -3,6 +3,8 @@ import logging
 from typing import Optional
 
 import httpx
+import socketio
+import stamina
 
 from app.actions.configurations import FlytBaseAuthConfig, FlytBasePullObservationsConfig
 from app.services import flytbase
@@ -17,6 +19,35 @@ logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
 
 OBSERVATIONS_BATCH_SIZE = 200
+
+
+def _is_transient_token_failure(exc: Exception) -> bool:
+    """The token endpoint never answered, or answered 429/5xx. A 4xx (rejected
+    credentials) is a definite answer and is not retried."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 429 or exc.response.status_code >= 500
+    return isinstance(exc, httpx.TransportError)
+
+
+# FlytBase's gateway intermittently answers 504 to the Socket.IO handshake and
+# to the token endpoint, usually within a second and before any data has been
+# collected. A few quick attempts ride over that; the overall timeout keeps a
+# real outage from eating into the 5-minute schedule.
+_FLYTBASE_RETRY = dict(attempts=3, timeout=30.0, wait_initial=1.0, wait_max=5.0, wait_jitter=1.0)
+FLYTBASE_CONNECT_RETRY = dict(on=socketio.exceptions.ConnectionError, **_FLYTBASE_RETRY)
+FLYTBASE_TOKEN_RETRY = dict(on=_is_transient_token_failure, **_FLYTBASE_RETRY)
+
+
+async def _collect_with_connect_retry(collect, **kwargs):
+    """
+    Runs a flytbase.collect_* coroutine function, retrying a failed Socket.IO
+    handshake. The collectors raise socketio's ConnectionError only from
+    sio.connect(), i.e. before the collection window starts, so a retry never
+    repeats a window or duplicates observations.
+    """
+    async for attempt in stamina.retry_context(**FLYTBASE_CONNECT_RETRY):
+        with attempt:
+            return await collect(**kwargs)
 
 
 @activity_logger()
@@ -93,7 +124,8 @@ async def action_pull_observations(integration, action_config: FlytBasePullObser
     base_url = auth_data.get("base_url") or flytbase.FLYTBASE_DEFAULT_BASE_URL
 
     # ── Step 3: Collect positions via Socket.IO (drone + dock in parallel) ──────
-    drone_task = flytbase.collect_drone_telemetry(
+    drone_task = _collect_with_connect_retry(
+        flytbase.collect_drone_telemetry,
         access_token=access_token,
         org_id=org_id,
         drone_ids=action_config.drone_ids,
@@ -104,7 +136,8 @@ async def action_pull_observations(integration, action_config: FlytBasePullObser
         collect_notifications=action_config.collect_drone_notifications,
     )
     if action_config.dock_ids:
-        dock_task = flytbase.collect_dock_telemetry(
+        dock_task = _collect_with_connect_retry(
+            flytbase.collect_dock_telemetry,
             access_token=access_token,
             org_id=org_id,
             dock_ids=action_config.dock_ids,
@@ -298,11 +331,13 @@ async def _get_valid_access_token(integration) -> str:
             "Cannot re-authenticate: auth action configuration missing. "
             "Please configure and run the 'auth' action manually."
         )
-    token_response = await flytbase.get_flytbase_token(
-        client_id=auth_data["client_id"],
-        client_secret=auth_data["client_secret"],
-        base_url=auth_data.get("base_url") or flytbase.FLYTBASE_DEFAULT_BASE_URL,
-    )
+    async for attempt in stamina.retry_context(**FLYTBASE_TOKEN_RETRY):
+        with attempt:
+            token_response = await flytbase.get_flytbase_token(
+                client_id=auth_data["client_id"],
+                client_secret=auth_data["client_secret"],
+                base_url=auth_data.get("base_url") or flytbase.FLYTBASE_DEFAULT_BASE_URL,
+            )
 
     new_state = _token_state_from_response(token_response)
     await state_manager.set_state(
